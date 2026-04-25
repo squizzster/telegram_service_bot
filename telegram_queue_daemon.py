@@ -186,8 +186,8 @@ class QueueDaemon:
             self.config.poll_seconds,
             self.config.queue_max_attempts,
         )
-        await asyncio.to_thread(self.queue_store.migrate_schema)
-        log.debug("Queue schema migration/check complete")
+        await asyncio.to_thread(self.queue_store.verify_schema)
+        log.debug("Queue schema verification complete")
 
         loop = asyncio.get_running_loop()
         self._install_signal_handlers(loop)

@@ -467,6 +467,12 @@ class SQLiteQueueStore:
         return result
 
     def migrate_schema(self) -> SchemaCheckResult:
+        """
+        Future hook for installed-base schema upgrades.
+
+        During active development, runtime startup intentionally only verifies
+        the current schema version and does not mutate existing databases.
+        """
         return self.verify_schema()
 
     def check_database(self) -> SchemaCheckResult:

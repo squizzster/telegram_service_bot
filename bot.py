@@ -630,7 +630,7 @@ async def main(debug: bool, *, save_dump_dir: bool = False) -> None:
         process_name="telegram-bot",
     ):
         queue_store = SQLiteQueueStore(config.sqlite_settings)
-        queue_store.migrate_schema()
+        queue_store.verify_schema()
         log.info("SQLite queue schema verified: %s", config.sqlite_settings.db_path)
         if config.service_dump_dir is not None:
             log.info("Telegram service dump capture enabled: %s", config.service_dump_dir)
