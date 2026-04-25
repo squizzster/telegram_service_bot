@@ -6,14 +6,18 @@
 
 The Telegram Queue Bot is a **durable, asynchronous Telegram ingestion and processing system**.
 
-It should not be understood as a conventional Telegram bot that receives a message and handles it inline. Its real architecture is a **two-process local-first processing pipeline**:
+It should not be understood as a conventional Telegram bot that receives a message and handles it inline. Its real architecture is now a **layered local-first processing pipeline**:
 
 ```text
 Telegram
   → bot.py webhook ingress
   → SQLite telegram_queue
   → telegram_queue_daemon.py worker
-  → processors
+  → canonical text
+  → action detection
+  → SQLite incoming_message_actions
+  → telegram_action_daemon.py worker
+  → action processors
   → Telegram reactions / replies / terminal state
 ```
 
@@ -23,7 +27,9 @@ The governing principle is:
 
 `bot.py` is the ingress edge. It faces Telegram, validates requests, normalizes updates, persists them into SQLite, gives immediate best-effort feedback, wakes the daemon, and returns quickly.
 
-`telegram_queue_daemon.py` is the processing engine. It owns queue claiming, retries, stage transitions, processor dispatch, transcript delivery, terminal state, and final reaction reconciliation.
+`telegram_queue_daemon.py` is the source-message processing engine. It owns queue claiming, retries, source-message stage transitions, content processor dispatch, transcript delivery, action detection, terminal source state, and final reaction reconciliation.
+
+`telegram_action_daemon.py` is the derived-work processing engine. It owns durable child action claiming, action-specific retries, action stage transitions, action processor dispatch, action outbound memory, and action terminal state.
 
 SQLite is the compact operational core of the system. It acts as:
 
@@ -47,11 +53,90 @@ The queue row is the durable memory of the system.
 
 Telegram reactions are the visible heartbeat.
 
-The daemon is the worker.
+The daemons are the workers.
 
 `bot.py` is the door.
 
 Processors are the specialized hands.
+
+---
+
+## Current Implementation Snapshot
+
+The current implemented runtime is:
+
+```text
+Telegram update
+  → bot.py
+  → telegram_queue
+  → telegram_queue_daemon.py
+  → processing_text
+  → OpenAI action classifier
+  → incoming_message_actions
+  → telegram_action_daemon.py
+  → action-specific processor
+```
+
+The current action catalog is:
+
+| Internal code       | Provider label        | Current processor                          |
+| ------------------- | --------------------- | ------------------------------------------ |
+| `NONE`              | `none`                | No child action row is created             |
+| `LOG_EXPENSES`      | `reporting_expenses`  | Temporary retry/success test processor     |
+| `LOG_INCOME`        | `reporting_income`    | Temporary retry/success test processor     |
+| `SET_REMINDER`      | `set_a_reminder`      | Temporary retry/success test processor     |
+| `ANSWER_QUESTION`   | `asking_a_question`   | OpenAI-backed question answering processor |
+
+The action detection prompt is:
+
+```python
+prompt={
+    "id": "pmpt_69ed0e37aab08193aef354f523d55a240171a57891089e80",
+    "variables": {
+        "incoming_text": incoming_text,
+    },
+}
+```
+
+The code intentionally does not pass a prompt version here. OpenAI should use the prompt's default version.
+
+The question-answering prompt is:
+
+```python
+prompt={
+    "id": "pmpt_69ed2980b0988195b26594cc5467f26f07bc6d43e5ee5db1",
+    "variables": {
+        "question_to_answer": question,
+    },
+}
+```
+
+The question-answering response must contain:
+
+````text
+```answer
+answer text
+```
+````
+
+Missing, empty, or unclosed `answer` blocks are treated as retryable provider failures.
+
+During development, schema compatibility is not preserved. The current schema version is `5`. Recreate the local SQLite database when the schema changes:
+
+```bash
+./bot_libs/sql_bot_init.py --drop-delete-current-db --force
+./bot_libs/sql_bot_init.py --check
+```
+
+Run the workers separately:
+
+```bash
+./bot.py
+./telegram_queue_daemon.py --DEBUG
+./telegram_action_daemon.py --DEBUG
+```
+
+The action daemon uses the same 1, 3, 9, ... retry schedule as the source queue.
 
 ---
 
@@ -98,7 +183,7 @@ Once a Telegram update has been inserted into SQLite, the job is no longer depen
 
 # 2. System topology
 
-At runtime, the system is composed of three main zones.
+At runtime, the system is composed of four main zones.
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
@@ -123,28 +208,38 @@ At runtime, the system is composed of three main zones.
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                  Durable core: SQLite queue                 │
+│                 Durable core: SQLite workflow               │
 │                                                             │
-│  - status                                                   │
-│  - stage                                                    │
-│  - attempts / available_at                                  │
-│  - payload_json / raw_update_json                           │
-│  - processing_text                                          │
-│  - outbound_json                                            │
-│  - result_json / errors                                     │
+│  - telegram_queue source rows                               │
+│  - action_detection_runs audit rows                         │
+│  - action_catalog vocabulary                                │
+│  - incoming_message_actions child jobs                      │
+│  - retry / lock / outbox / result state                     │
 └──────────────────────────────┬──────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              Processing engine: queue daemon                │
+│          Source processing engine: queue daemon             │
 │                                                             │
 │  - claim due rows                                           │
 │  - recover stale processing jobs                            │
 │  - dispatch processors                                      │
 │  - mutate stages                                            │
 │  - handle retries                                           │
-│  - send replies                                             │
-│  - reconcile terminal reactions                             │
+│  - produce canonical processing_text                        │
+│  - detect actions                                           │
+│  - create durable child action jobs                         │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│         Derived work engine: action daemon                  │
+│                                                             │
+│  - claim due incoming_message_actions rows                  │
+│  - dispatch by action_code                                  │
+│  - run action-specific workflows                            │
+│  - persist action outbound/result state                     │
+│  - retry or dead-letter failed action jobs                  │
 └──────────────────────────────┬──────────────────────────────┘
                                │
                                ▼
@@ -159,18 +254,20 @@ At runtime, the system is composed of three main zones.
 │  - 🤔 / 🥱 / 😴 retry waiting                                │
 │  - 💔 failed                                                 │
 │  - transcript replies                                       │
+│  - action replies, including question answers               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 The system is intentionally split around operational responsibility.
 
-| Runtime part               | Architectural role     | Owns                                                                    |
-| -------------------------- | ---------------------- | ----------------------------------------------------------------------- |
-| `bot.py`                   | Ingress edge           | Validation, normalization, queue insertion, immediate acknowledgement   |
-| SQLite                     | Durable core           | Queue state, processing memory, retry timing, idempotency, auditability |
-| `telegram_queue_daemon.py` | Processing engine      | Claiming, processing, retries, replies, terminal outcomes               |
-| Processors                 | Specialized work units | Content-specific behavior                                               |
-| Reactions                  | UX projection          | Best-effort visible state, never source of truth                        |
+| Runtime part                | Architectural role          | Owns                                                                    |
+| --------------------------- | --------------------------- | ----------------------------------------------------------------------- |
+| `bot.py`                    | Ingress edge                | Validation, normalization, queue insertion, immediate acknowledgement   |
+| SQLite                      | Durable workflow core       | Source rows, action rows, retry timing, locks, idempotency, audit data  |
+| `telegram_queue_daemon.py`  | Source-message engine       | Source claiming, content processing, canonical text, action detection   |
+| `telegram_action_daemon.py` | Derived-action engine       | Action claiming, action workflows, action retries, action terminal state |
+| Processors                  | Specialized work units      | Content-specific and action-specific behavior                           |
+| Reactions                   | UX projection               | Best-effort visible state, never source of truth                        |
 
 ---
 
@@ -408,7 +505,7 @@ This allows reaction failures, Telegram rate limits, or deleted messages to be h
 
 ## 6.1 Startup hardening
 
-Both runtime processes begin by validating that the system is capable of running.
+Runtime processes begin by validating that the system is capable of running.
 
 ```text
 load config
@@ -431,7 +528,7 @@ Important dependency classes include:
 | --------------- | -------------------------------------------------------- |
 | Python packages | Telegram/PTB, Starlette, Uvicorn, HTTP clients, STT SDKs |
 | System tools    | `ffprobe`                                                |
-| Credentials     | Telegram, OpenAI, Deepgram, Gemini                       |
+| Credentials     | Telegram, OpenAI, Deepgram, Gemini, depending on process |
 | Local storage   | SQLite database path and expected schema                 |
 | Process control | pidfile lock paths                                       |
 
@@ -1271,11 +1368,12 @@ The system includes several operational safety mechanisms.
 
 ## 17.1 Process guards
 
-Both main processes use pidfile locking.
+The main runtimes use pidfile locking.
 
 ```text
 bot pidfile
-daemon pidfile
+queue daemon pidfile
+action daemon pidfile
 fcntl lock
 process metadata validation
 ```
@@ -1329,21 +1427,25 @@ As the system matures, this could be made more flexible by distinguishing requir
 
 ## Durable state
 
-| Component         | Role                                                               |
-| ----------------- | ------------------------------------------------------------------ |
-| `queue_models.py` | Shared data contracts, content/status constants, stable JSON       |
-| `sql.py`          | SQLite schema, queue transitions, claiming, retries, stage updates |
-| `stage_names.py`  | Central stage vocabulary                                           |
-| `retry_policy.py` | Retry schedule and retry delay classification                      |
+| Component          | Role                                                                         |
+| ------------------ | ---------------------------------------------------------------------------- |
+| `queue_models.py`  | Shared source-message data contracts, content/status constants, stable JSON  |
+| `action_models.py` | Action catalog constants, provider labels, detection status contracts        |
+| `sql.py`           | SQLite schema, source/action transitions, claiming, retries, stage updates   |
+| `stage_names.py`   | Central source and action stage vocabulary                                   |
+| `retry_policy.py`  | Retry schedule and retry delay classification                                |
 
 ## Processing
 
-| Component                      | Role                                                         |
-| ------------------------------ | ------------------------------------------------------------ |
-| `telegram_queue_daemon.py`     | Queue worker, retry engine, terminal state owner             |
-| `queue_processors/dispatch.py` | Content-type processor routing                               |
-| `queue_processing_context.py`  | Controlled processor access to stage/text/outbound mutations |
-| `queue_processor_errors.py`    | Processor outcome/error vocabulary                           |
+| Component                      | Role                                                                  |
+| ------------------------------ | --------------------------------------------------------------------- |
+| `telegram_queue_daemon.py`     | Source queue worker, retry engine, action detection handoff           |
+| `telegram_action_daemon.py`    | Child action worker, action retry engine, action terminal state owner |
+| `queue_processors/dispatch.py` | Content-type processor routing                                        |
+| `action_dispatch.py`           | Action-code processor routing                                         |
+| `queue_processing_context.py`  | Controlled source processor stage/text/outbound mutations             |
+| `action_processing_context.py` | Controlled action processor stage/outbound mutations                  |
+| `queue_processor_errors.py`    | Processor outcome/error vocabulary                                    |
 
 ## Content processors
 
@@ -1367,6 +1469,18 @@ As the system matures, this could be made more flexible by distinguishing requir
 | `deepgram_audio.py`        | Deepgram transcription adapter           |
 | `audio_validation.py`      | ffprobe and speech-rate validation       |
 | `transcript_validation.py` | Prompt-echo and transcript sanity guard  |
+
+## Action detection and action processors
+
+| Component                         | Role                                                             |
+| --------------------------------- | ---------------------------------------------------------------- |
+| `action_detection.py`             | Source-row action detection orchestration and audit persistence  |
+| `action_detection_openai.py`      | OpenAI classifier adapter for canonical text action labels       |
+| `action_detection_validation.py`  | Strict validation of provider action label output                |
+| `question_answering_openai.py`    | OpenAI question-answering adapter requiring an `answer` block    |
+| `action_processors/questions.py`  | `ANSWER_QUESTION` workflow, reply sending, outbound idempotency  |
+| `action_processors/temporary.py`  | Temporary processors for expenses, income, and reminders         |
+| `telegram_message_utils.py`       | Telegram-safe text chunking helpers                              |
 
 ## UX and Telegram feedback
 
@@ -1608,9 +1722,9 @@ This is future hardening, not a flaw in the current architectural concept.
 
 ## 20.5 Product expansion
 
-The current product value is concentrated in voice/audio transcription.
+The current product value is concentrated in voice/audio transcription plus the first real text-derived action workflow: answering questions.
 
-Other processors are metadata-oriented.
+Expense, income, and reminder action processors are currently temporary workflow placeholders.
 
 That is fine if intentional.
 
@@ -1684,9 +1798,12 @@ This system is best understood as:
 
 ```text
 a durable Telegram intake service
-+ a SQLite-backed asynchronous processing daemon
++ a SQLite-backed source-message daemon
++ a SQLite-backed derived-action daemon
 + a state-driven Telegram reaction UX layer
 + a voice/audio transcription pipeline
++ a canonical text action-detection pipeline
++ action-specific workflows such as question answering
 + retry, replay, and idempotent output semantics
 ```
 
@@ -1695,9 +1812,14 @@ The central loop is:
 ```text
 external Telegram event
   → normalized durable row
-  → daemon claim
-  → stage mutation
+  → source daemon claim
+  → source stage mutation
   → content-specific processing
+  → canonical processing_text
+  → action detection
+  → durable action jobs
+  → action daemon claim
+  → action-specific processing
   → persisted progress
   → Telegram feedback
   → terminal state
@@ -1711,6 +1833,9 @@ payload_json is the normalized intent.
 raw_update_json is the evidence.
 processing_text is reusable semantic progress.
 outbound_json is the external side-effect ledger.
+action_catalog is the durable vocabulary of supported action families.
+action_detection_runs is the classifier audit trail.
+incoming_message_actions is the durable child-work queue.
 status is queue mechanics.
 stage is workflow meaning.
 reaction is visible but non-authoritative feedback.
@@ -1719,11 +1844,10 @@ processor exceptions are state-transition signals.
 
 The most important architectural sentence is:
 
-> **The database row is the system’s memory; the daemon is the worker; `bot.py` is the ingress edge; processors are specialized hands; and Telegram reactions are the visible heartbeat of the pipeline.**
+> **The database rows are the system’s memory; the daemons are the workers; `bot.py` is the ingress edge; processors are specialized hands; and Telegram reactions are the visible heartbeat of the pipeline.**
 
 This is a sound local-first architecture.
 
 Its core is not fragile or accidental.
 
 It is an intentionally durable, observable, resumable Telegram processing system whose main future work is operational maturation: richer provider configuration, queue visibility, retention strategy, production-grade migrations, and expanded processors.
-
