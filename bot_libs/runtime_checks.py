@@ -61,27 +61,39 @@ class RuntimeCheckReport:
     credentials_checked: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeCheckProfile:
+    imports: tuple[tuple[str, str], ...]
+    commands: tuple[tuple[str, str], ...]
+    env_vars: tuple[str, ...]
+    credentials: tuple[str, ...]
+
+
 async def run_runtime_system_checks(
     *,
     component: str,
     timeout_seconds: float = DEFAULT_CHECK_TIMEOUT_SECONDS,
 ) -> RuntimeCheckReport:
+    profile = _profile_for_component(component)
     failures: list[str] = []
-    failures.extend(_check_imports())
-    failures.extend(_check_commands())
-    failures.extend(_check_required_env())
+    failures.extend(_check_imports(profile.imports))
+    failures.extend(_check_commands(profile.commands))
+    failures.extend(_check_required_env(profile.env_vars))
     if failures:
         raise RuntimeCheckError(_format_failures(failures))
 
-    credential_failures = await _check_credentials(timeout_seconds=timeout_seconds)
+    credential_failures = await _check_credentials(
+        timeout_seconds=timeout_seconds,
+        credential_labels=profile.credentials,
+    )
     if credential_failures:
         raise RuntimeCheckError(_format_failures(credential_failures))
 
     report = RuntimeCheckReport(
-        imports_checked=tuple(label for label, _ in REQUIRED_IMPORTS),
-        commands_checked=tuple(label for label, _ in REQUIRED_COMMANDS),
-        env_vars_checked=REQUIRED_ENV_VARS,
-        credentials_checked=("telegram", "OPEN_AI", "deepgram", "google"),
+        imports_checked=tuple(label for label, _ in profile.imports),
+        commands_checked=tuple(label for label, _ in profile.commands),
+        env_vars_checked=profile.env_vars,
+        credentials_checked=profile.credentials,
     )
     log.info(
         "Runtime system checks passed component=%s imports=%s commands=%s "
@@ -95,31 +107,60 @@ async def run_runtime_system_checks(
     return report
 
 
-def _check_imports() -> list[str]:
+def _profile_for_component(component: str) -> RuntimeCheckProfile:
+    if component == "action-daemon":
+        return RuntimeCheckProfile(
+            imports=(
+                ("telegram", "telegram"),
+                ("openai", "openai"),
+                ("sqlite3", "sqlite3"),
+            ),
+            commands=(),
+            env_vars=("TELEGRAM_BOT_KEY", "SQL_TELEGRAM_FILE", "OPENAI_API_KEY"),
+            credentials=("telegram", "OPEN_AI"),
+        )
+
+    return RuntimeCheckProfile(
+        imports=REQUIRED_IMPORTS,
+        commands=REQUIRED_COMMANDS,
+        env_vars=REQUIRED_ENV_VARS,
+        credentials=("telegram", "OPEN_AI", "deepgram", "google"),
+    )
+
+
+def _check_imports(
+    imports: tuple[tuple[str, str], ...] = REQUIRED_IMPORTS,
+) -> list[str]:
     failures: list[str] = []
-    for label, module_name in REQUIRED_IMPORTS:
+    for label, module_name in imports:
         if importlib.util.find_spec(module_name) is None:
             failures.append(f"missing Python module {label!r} ({module_name})")
     return failures
 
 
-def _check_commands() -> list[str]:
+def _check_commands(
+    commands: tuple[tuple[str, str], ...] = REQUIRED_COMMANDS,
+) -> list[str]:
     failures: list[str] = []
-    for label, command in REQUIRED_COMMANDS:
+    for label, command in commands:
         if shutil.which(command) is None:
             failures.append(f"missing required executable {label!r} on PATH")
     return failures
 
 
-def _check_required_env() -> list[str]:
+def _check_required_env(env_vars: tuple[str, ...] = REQUIRED_ENV_VARS) -> list[str]:
     failures: list[str] = []
-    for env_var in REQUIRED_ENV_VARS:
+    for env_var in env_vars:
         if not (os.getenv(env_var) or "").strip():
             failures.append(f"missing required environment variable {env_var}")
     return failures
 
 
-async def _check_credentials(*, timeout_seconds: float) -> list[str]:
+async def _check_credentials(
+    *,
+    timeout_seconds: float,
+    credential_labels: tuple[str, ...] = ("telegram", "OPEN_AI", "deepgram", "google"),
+) -> list[str]:
     try:
         import httpx
     except ImportError as exc:
@@ -128,12 +169,7 @@ async def _check_credentials(*, timeout_seconds: float) -> list[str]:
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 5.0)),
     ) as client:
-        checks = (
-            _check_telegram_key(client),
-            _check_openai_key(client),
-            _check_deepgram_key(client),
-            _check_gemini_key(client),
-        )
+        checks = tuple(_credential_check(client, label) for label in credential_labels)
         results = await asyncio.gather(*checks, return_exceptions=True)
 
     failures: list[str] = []
@@ -147,6 +183,18 @@ async def _check_credentials(*, timeout_seconds: float) -> list[str]:
             continue
         failures.append(result)
     return failures
+
+
+def _credential_check(client: Any, label: str) -> Any:
+    if label == "telegram":
+        return _check_telegram_key(client)
+    if label == "OPEN_AI":
+        return _check_openai_key(client)
+    if label == "deepgram":
+        return _check_deepgram_key(client)
+    if label == "google":
+        return _check_gemini_key(client)
+    raise ValueError(f"unknown credential check label {label!r}")
 
 
 async def _check_telegram_key(client: Any) -> str | None:

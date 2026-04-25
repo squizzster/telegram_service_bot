@@ -7,11 +7,13 @@ ACTION_NONE = "NONE"
 ACTION_LOG_EXPENSES = "LOG_EXPENSES"
 ACTION_LOG_INCOME = "LOG_INCOME"
 ACTION_SET_REMINDER = "SET_REMINDER"
+ACTION_ANSWER_QUESTION = "ANSWER_QUESTION"
 
 ACTION_PROVIDER_NONE = "none"
 ACTION_PROVIDER_LOG_EXPENSES = "reporting_expenses"
 ACTION_PROVIDER_LOG_INCOME = "reporting_income"
 ACTION_PROVIDER_SET_REMINDER = "set_a_reminder"
+ACTION_PROVIDER_ASKING_A_QUESTION = "asking_a_question"
 
 ACTION_STATUS_QUEUED = "queued"
 ACTION_STATUS_PROCESSING = "processing"
@@ -70,6 +72,13 @@ ACTION_CATALOG_SEED: tuple[tuple[str, str, str, str, int], ...] = (
         ACTION_PROVIDER_SET_REMINDER,
         "Set reminder",
         "The user wants to be reminded about something in the future.",
+        1,
+    ),
+    (
+        ACTION_ANSWER_QUESTION,
+        ACTION_PROVIDER_ASKING_A_QUESTION,
+        "Answer question",
+        "The user is asking a question that should be answered.",
         1,
     ),
 )

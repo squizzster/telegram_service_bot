@@ -22,6 +22,8 @@ from bot_libs.action_detection import ActionDetectionService  # noqa: E402
 from bot_libs.daemon_signal import (  # noqa: E402
     DAEMON_PROCESS_NAME,
     resolve_daemon_pidfile,
+    resolve_action_daemon_pidfile,
+    wake_action_daemon,
 )
 from bot_libs.logging_utils import configure_app_logging  # noqa: E402
 from bot_libs.process_guard import (  # noqa: E402
@@ -52,6 +54,7 @@ from bot_libs.sql import (  # noqa: E402
     build_sqlite_settings_from_env,
 )
 from bot_libs.reaction_policy import (  # noqa: E402
+    REACTION_CALLING_STT_API,
     REACTION_FAILURE,
     REACTION_SUCCESS,
     REACTION_UNSUPPORTED,
@@ -90,6 +93,7 @@ class Config:
     stale_lock_seconds: int
     queue_max_attempts: int
     pidfile_path: str
+    action_daemon_pidfile_path: str
 
     @classmethod
     def from_env(
@@ -126,6 +130,7 @@ class Config:
             stale_lock_seconds=stale_lock_seconds,
             queue_max_attempts=queue_max_attempts,
             pidfile_path=resolve_daemon_pidfile(pidfile_path),
+            action_daemon_pidfile_path=resolve_action_daemon_pidfile(),
         )
 
 
@@ -462,23 +467,38 @@ class QueueDaemon:
                 job_id,
             )
             return
-        reaction_set = await set_row_reaction(
-            bot,
-            latest_row,
-            REACTION_SUCCESS,
-            reason="processed_done",
-        )
-        if not reaction_set:
-            log.debug(
-                "Success reaction was not updated for queue job id=%s emoji=%s",
-                job_id,
-                REACTION_SUCCESS,
+        if _created_child_actions(action_result):
+            reaction_set = await set_row_reaction(
+                bot,
+                latest_row,
+                REACTION_CALLING_STT_API,
+                reason="actions_queued",
             )
-        self._schedule_reaction_reconcile(
-            bot,
-            latest_row,
-            reason="processed_done_confirm",
-        )
+            if not reaction_set:
+                log.debug(
+                    "Action-queued reaction was not updated for queue job id=%s emoji=%s",
+                    job_id,
+                    REACTION_CALLING_STT_API,
+                )
+            await self._wake_action_daemon(job_id, action_result=action_result)
+        else:
+            reaction_set = await set_row_reaction(
+                bot,
+                latest_row,
+                REACTION_SUCCESS,
+                reason="processed_done",
+            )
+            if not reaction_set:
+                log.debug(
+                    "Success reaction was not updated for queue job id=%s emoji=%s",
+                    job_id,
+                    REACTION_SUCCESS,
+                )
+            self._schedule_reaction_reconcile(
+                bot,
+                latest_row,
+                reason="processed_done_confirm",
+            )
         log.info(
             "Marked queue job done id=%s attempts=%s processor=%s",
             job_id,
@@ -905,6 +925,40 @@ class QueueDaemon:
                 released_count,
             )
 
+    async def _wake_action_daemon(
+        self,
+        job_id: int,
+        *,
+        action_result: Mapping[str, object],
+    ) -> None:
+        try:
+            wake_result = await asyncio.to_thread(
+                wake_action_daemon,
+                self.config.action_daemon_pidfile_path,
+            )
+        except Exception:
+            log.exception(
+                "Failed to wake action daemon after source job done id=%s",
+                job_id,
+            )
+            return
+
+        if wake_result.signaled:
+            log.debug(
+                "Woke action daemon after source job done id=%s pid=%s created_actions=%s",
+                job_id,
+                wake_result.pid,
+                action_result.get("created_action_count"),
+            )
+            return
+
+        log.debug(
+            "Action daemon wake skipped after source job done id=%s reason=%s pid=%s",
+            job_id,
+            wake_result.reason,
+            wake_result.pid,
+        )
+
     def _install_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
         loop.add_signal_handler(signal.SIGHUP, self._handle_signal, signal.SIGHUP)
         loop.add_signal_handler(signal.SIGTERM, self._handle_signal, signal.SIGTERM)
@@ -1055,6 +1109,13 @@ def _normalize_success_result(
     result_json.setdefault("outcome", "processed")
     result_json.setdefault("attempts", attempts)
     return result_json
+
+
+def _created_child_actions(action_result: Mapping[str, object]) -> bool:
+    try:
+        return int(action_result.get("created_action_count", 0)) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 if __name__ == "__main__":

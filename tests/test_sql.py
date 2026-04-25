@@ -17,15 +17,27 @@ from bot_libs.queue_models import (
     QueueJobData,
 )
 from bot_libs.action_models import (
+    ACTION_ANSWER_QUESTION,
     ACTION_DETECTION_COMPLETE,
     ACTION_DETECTION_PENDING,
     ACTION_DETECTION_PROCESSING,
     ACTION_LOG_EXPENSES,
     ACTION_LOG_INCOME,
+    ACTION_PROVIDER_ASKING_A_QUESTION,
     ACTION_PROVIDER_LOG_EXPENSES,
     ACTION_PROVIDER_LOG_INCOME,
+    ACTION_STATUS_DEAD,
+    ACTION_STATUS_DONE,
+    ACTION_STATUS_PROCESSING,
+    ACTION_STATUS_QUEUED,
 )
-from bot_libs.stage_names import STAGE_MESSAGE_REMOVED, STAGE_RETRY_WAITING
+from bot_libs.stage_names import (
+    STAGE_DONE,
+    STAGE_FAILED,
+    STAGE_MESSAGE_REMOVED,
+    STAGE_PROCESSING_ACTION,
+    STAGE_RETRY_WAITING,
+)
 from bot_libs.sql import (
     QueueStoreError,
     SQLiteQueueStore,
@@ -147,7 +159,9 @@ class SQLiteQueueStoreTests(unittest.TestCase):
 
             self.assertTrue(check.ok)
             self.assertIn(ACTION_PROVIDER_LOG_EXPENSES, catalog_by_label)
+            self.assertIn(ACTION_PROVIDER_ASKING_A_QUESTION, catalog_by_label)
             self.assertIn(ACTION_LOG_EXPENSES, catalog_by_code)
+            self.assertIn(ACTION_ANSWER_QUESTION, catalog_by_code)
             self.assertFalse(catalog_by_code["NONE"].is_executable)
             self.assertTrue(catalog_by_code[ACTION_LOG_INCOME].is_enabled)
 
@@ -680,3 +694,207 @@ class SQLiteQueueStoreTests(unittest.TestCase):
             self.assertEqual(row["action_detection_status"], ACTION_DETECTION_PENDING)
             self.assertEqual(run_row["status"], "failed")
             self.assertEqual(run_row["error"], "stale_processing_recovered")
+
+    def test_claim_next_action_waits_until_source_job_is_done(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.sqlite"
+            store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
+            store.create_schema(create_parent_dir=True)
+            insert_result = store.insert_queue_job(
+                make_job(processing_text="I spent 30 on petrol")
+            )
+            queue_id = int(insert_result.queue_id)
+            run_id = store.start_action_detection_run(
+                queue_id=queue_id,
+                provider="openai",
+                prompt_id="prompt",
+                prompt_version="1",
+                incoming_text_chars=20,
+                incoming_text_sha256="abc",
+            )
+            store.complete_action_detection(
+                queue_id=queue_id,
+                detection_run_id=run_id,
+                raw_response_json={"output_text": '["reporting_expenses"]'},
+                normalized_actions_json={
+                    "status": ACTION_DETECTION_COMPLETE,
+                    "provider_labels": ["reporting_expenses"],
+                    "action_codes": [ACTION_LOG_EXPENSES],
+                    "none": False,
+                },
+                action_codes=(ACTION_LOG_EXPENSES,),
+            )
+
+            self.assertIsNone(store.get_next_action_available_at())
+            self.assertIsNone(store.claim_next_action(worker_name="action-worker"))
+
+            store.mark_job_done(queue_id, result_json={"ok": True})
+            self.assertIsNotNone(store.get_next_action_available_at())
+            claim = store.claim_next_action(worker_name="action-worker")
+
+            self.assertIsNotNone(claim)
+            assert claim is not None
+            self.assertEqual(claim["queue_id"], queue_id)
+            self.assertEqual(claim["source_status"], "done")
+            self.assertEqual(claim["action_code"], ACTION_LOG_EXPENSES)
+            self.assertEqual(claim["status"], ACTION_STATUS_PROCESSING)
+            self.assertEqual(claim["stage"], STAGE_PROCESSING_ACTION)
+            self.assertEqual(claim["attempts"], 1)
+            self.assertEqual(claim["locked_by"], "action-worker")
+            self.assertEqual(claim["chat_id"], 123)
+            self.assertEqual(claim["message_id"], 456)
+            self.assertEqual(claim["processing_text"], "I spent 30 on petrol")
+
+    def test_mark_action_for_retry_persists_backoff_state(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.sqlite"
+            store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
+            store.create_schema(create_parent_dir=True)
+            insert_result = store.insert_queue_job(
+                make_job(processing_text="I spent 30 on petrol")
+            )
+            queue_id = int(insert_result.queue_id)
+            store.insert_incoming_message_actions(
+                queue_id=queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_LOG_EXPENSES,),
+            )
+            store.mark_job_done(queue_id, result_json={"ok": True})
+            claim = store.claim_next_action(worker_name="action-worker")
+            assert claim is not None
+
+            store.mark_action_for_retry(
+                int(claim["id"]),
+                delay_seconds=3,
+                last_error="temporary failure",
+            )
+            action = store.get_action_job(int(claim["id"]))
+
+            self.assertIsNotNone(action)
+            assert action is not None
+            self.assertEqual(action["status"], ACTION_STATUS_QUEUED)
+            self.assertEqual(action["stage"], STAGE_RETRY_WAITING)
+            self.assertEqual(action["last_error"], "temporary failure")
+            self.assertIsNone(action["locked_at"])
+            self.assertIsNone(action["locked_by"])
+            self.assertIsNone(action["finished_at"])
+            self.assertGreater(
+                datetime.strptime(action["available_at"], "%Y-%m-%d %H:%M:%S"),
+                datetime.now() - timedelta(seconds=1),
+            )
+
+    def test_mark_action_done_and_dead_are_terminal(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.sqlite"
+            store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
+            store.create_schema(create_parent_dir=True)
+            insert_result = store.insert_queue_job(make_job(processing_text="hello"))
+            queue_id = int(insert_result.queue_id)
+            store.insert_incoming_message_actions(
+                queue_id=queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_LOG_EXPENSES, ACTION_LOG_INCOME),
+            )
+            store.mark_job_done(queue_id, result_json={"ok": True})
+            first = store.claim_next_action(worker_name="action-worker")
+            second = store.claim_next_action(worker_name="action-worker")
+            assert first is not None
+            assert second is not None
+
+            store.mark_action_done(
+                int(first["id"]),
+                result_json={"done": True},
+                stage=STAGE_DONE,
+            )
+            store.mark_action_dead(
+                int(second["id"]),
+                last_error="permanent failure",
+                result_json={"dead": True},
+                stage=STAGE_FAILED,
+            )
+
+            done_action = store.get_action_job(int(first["id"]))
+            dead_action = store.get_action_job(int(second["id"]))
+            assert done_action is not None
+            assert dead_action is not None
+            self.assertEqual(done_action["status"], ACTION_STATUS_DONE)
+            self.assertEqual(done_action["stage"], STAGE_DONE)
+            self.assertEqual(json.loads(done_action["result_json"]), {"done": True})
+            self.assertIsNone(done_action["locked_at"])
+            self.assertIsNotNone(done_action["finished_at"])
+            self.assertEqual(dead_action["status"], ACTION_STATUS_DEAD)
+            self.assertEqual(dead_action["stage"], STAGE_FAILED)
+            self.assertEqual(dead_action["last_error"], "permanent failure")
+            self.assertEqual(json.loads(dead_action["result_json"]), {"dead": True})
+            self.assertIsNotNone(dead_action["finished_at"])
+
+    def test_mark_action_for_retry_exhausted_marks_dead(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.sqlite"
+            store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
+            store.create_schema(create_parent_dir=True)
+            insert_result = store.insert_queue_job(make_job(processing_text="hello"))
+            queue_id = int(insert_result.queue_id)
+            store.insert_incoming_message_actions(
+                queue_id=queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_LOG_EXPENSES,),
+            )
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("UPDATE incoming_message_actions SET max_attempts = 1")
+                conn.commit()
+            store.mark_job_done(queue_id, result_json={"ok": True})
+            claim = store.claim_next_action(worker_name="action-worker")
+            assert claim is not None
+
+            store.mark_action_for_retry(
+                int(claim["id"]),
+                delay_seconds=1,
+                last_error="temporary failure",
+            )
+            action = store.get_action_job(int(claim["id"]))
+
+            self.assertIsNotNone(action)
+            assert action is not None
+            self.assertEqual(action["status"], ACTION_STATUS_DEAD)
+            self.assertEqual(action["stage"], STAGE_FAILED)
+            self.assertEqual(action["last_error"], "temporary failure")
+            self.assertIsNotNone(action["finished_at"])
+
+    def test_requeue_stale_processing_actions_resets_to_retry_waiting(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.sqlite"
+            store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
+            store.create_schema(create_parent_dir=True)
+            insert_result = store.insert_queue_job(make_job(processing_text="hello"))
+            queue_id = int(insert_result.queue_id)
+            store.insert_incoming_message_actions(
+                queue_id=queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_LOG_EXPENSES,),
+            )
+            store.mark_job_done(queue_id, result_json={"ok": True})
+            claim = store.claim_next_action(worker_name="action-worker")
+            assert claim is not None
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE incoming_message_actions
+                    SET locked_at = ?
+                    WHERE id = ?
+                    """,
+                    ("2000-01-01 00:00:00", int(claim["id"])),
+                )
+                conn.commit()
+
+            recovered = store.requeue_stale_processing_actions(older_than_seconds=1)
+            action = store.get_action_job(int(claim["id"]))
+
+            self.assertEqual(recovered, 1)
+            self.assertIsNotNone(action)
+            assert action is not None
+            self.assertEqual(action["status"], ACTION_STATUS_QUEUED)
+            self.assertEqual(action["stage"], STAGE_RETRY_WAITING)
+            self.assertEqual(action["last_error"], "stale_action_lock_recovered")
+            self.assertIsNone(action["locked_at"])
+            self.assertIsNone(action["locked_by"])

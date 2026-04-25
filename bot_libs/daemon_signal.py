@@ -15,6 +15,11 @@ DEFAULT_DAEMON_PIDFILE = "/tmp/telegram_queue_daemon.pid"
 DAEMON_PROCESS_NAME = "telegram-queue-daemon"
 DAEMON_ARGV_MARKER = "telegram_queue_daemon.py"
 
+ACTION_DAEMON_PIDFILE_ENV = "TELEGRAM_ACTION_DAEMON_PIDFILE"
+DEFAULT_ACTION_DAEMON_PIDFILE = "/tmp/telegram_action_daemon.pid"
+ACTION_DAEMON_PROCESS_NAME = "telegram-action-daemon"
+ACTION_DAEMON_ARGV_MARKER = "telegram_action_daemon.py"
+
 
 @dataclass(frozen=True, slots=True)
 class DaemonSignalResult:
@@ -27,16 +32,45 @@ def resolve_daemon_pidfile(value: str | None = None) -> str:
     return (value or os.getenv(DAEMON_PIDFILE_ENV) or DEFAULT_DAEMON_PIDFILE).strip()
 
 
+def resolve_action_daemon_pidfile(value: str | None = None) -> str:
+    return (
+        value
+        or os.getenv(ACTION_DAEMON_PIDFILE_ENV)
+        or DEFAULT_ACTION_DAEMON_PIDFILE
+    ).strip()
+
+
 def wake_queue_daemon(pidfile_path: str | Path | None = None) -> DaemonSignalResult:
-    resolved_pidfile = Path(pidfile_path or resolve_daemon_pidfile())
+    return _wake_daemon(
+        pidfile_path=pidfile_path or resolve_daemon_pidfile(),
+        expected_process_name=DAEMON_PROCESS_NAME,
+        expected_argv_marker=DAEMON_ARGV_MARKER,
+    )
+
+
+def wake_action_daemon(pidfile_path: str | Path | None = None) -> DaemonSignalResult:
+    return _wake_daemon(
+        pidfile_path=pidfile_path or resolve_action_daemon_pidfile(),
+        expected_process_name=ACTION_DAEMON_PROCESS_NAME,
+        expected_argv_marker=ACTION_DAEMON_ARGV_MARKER,
+    )
+
+
+def _wake_daemon(
+    *,
+    pidfile_path: str | Path,
+    expected_process_name: str,
+    expected_argv_marker: str,
+) -> DaemonSignalResult:
+    resolved_pidfile = Path(pidfile_path)
     metadata = read_process_metadata(resolved_pidfile)
     if metadata is None:
         return DaemonSignalResult(signaled=False, reason="pidfile_missing_or_invalid")
 
     if not is_expected_live_process(
         metadata,
-        expected_process_name=DAEMON_PROCESS_NAME,
-        expected_argv_marker=DAEMON_ARGV_MARKER,
+        expected_process_name=expected_process_name,
+        expected_argv_marker=expected_argv_marker,
     ):
         return DaemonSignalResult(
             signaled=False,

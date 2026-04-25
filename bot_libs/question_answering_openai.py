@@ -3,40 +3,50 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any
 
-from bot_libs.action_models import ProviderActionDetectionResult
 from bot_libs.queue_processor_errors import PermanentJobError, RetryableJobError
 
-OPENAI_ACTION_DETECTION_PROVIDER = "openai"
-DEFAULT_OPENAI_ACTION_PROMPT_ID = "pmpt_69ed0e37aab08193aef354f523d55a240171a57891089e80"
+OPENAI_QUESTION_ANSWERING_PROVIDER = "openai"
+DEFAULT_OPENAI_QUESTION_ANSWERING_PROMPT_ID = (
+    "pmpt_69ed2980b0988195b26594cc5467f26f07bc6d43e5ee5db1"
+)
 PROMPT_ID_ENV_KEYS = (
-    "OPENAI_ACTION_DETECTION_PROMPT_ID",
-    "ACTION_DETECTION_OPENAI_PROMPT_ID",
+    "OPENAI_QUESTION_ANSWERING_PROMPT_ID",
+    "QUESTION_ANSWERING_OPENAI_PROMPT_ID",
 )
 
 log = logging.getLogger(__name__)
 
 
-def resolve_openai_action_prompt_id() -> str:
-    return _resolve_first_env(PROMPT_ID_ENV_KEYS, DEFAULT_OPENAI_ACTION_PROMPT_ID)
+@dataclass(frozen=True, slots=True)
+class QuestionAnsweringResult:
+    provider: str
+    prompt_id: str
+    answer_text: str
+    raw_response: dict[str, Any]
 
 
-async def detect_actions_with_openai(
-    *,
-    incoming_text: str,
-) -> ProviderActionDetectionResult:
-    prompt_id = resolve_openai_action_prompt_id()
+def resolve_openai_question_answering_prompt_id() -> str:
+    return _resolve_first_env(
+        PROMPT_ID_ENV_KEYS,
+        DEFAULT_OPENAI_QUESTION_ANSWERING_PROMPT_ID,
+    )
+
+
+async def answer_question_with_openai(*, question_to_answer: str) -> QuestionAnsweringResult:
+    prompt_id = resolve_openai_question_answering_prompt_id()
     log.debug(
-        "OpenAI action detection request starting prompt_id=%s chars=%s",
+        "OpenAI question answering request starting prompt_id=%s chars=%s",
         prompt_id,
-        len(incoming_text),
+        len(question_to_answer),
     )
 
     try:
         response = await asyncio.to_thread(
-            _detect_actions_sync,
-            incoming_text,
+            _answer_question_sync,
+            question_to_answer,
             prompt_id,
         )
     except (PermanentJobError, RetryableJobError):
@@ -45,30 +55,26 @@ async def detect_actions_with_openai(
         raise _job_error_from_openai_error(exc) from exc
 
     response_text = _extract_response_text(response)
-    raw_actions_text = _extract_actions_text(response_text)
+    answer_text = _extract_answer_block(response_text)
     raw_response = _summarize_response(
         response,
         response_text=response_text,
-        raw_actions_text=raw_actions_text,
+        answer_text=answer_text,
     )
     log.debug(
-        "OpenAI action detection request succeeded prompt_id=%s output_chars=%s",
+        "OpenAI question answering request succeeded prompt_id=%s answer_chars=%s",
         prompt_id,
-        len(raw_actions_text),
+        len(answer_text),
     )
-    return ProviderActionDetectionResult(
-        provider=OPENAI_ACTION_DETECTION_PROVIDER,
+    return QuestionAnsweringResult(
+        provider=OPENAI_QUESTION_ANSWERING_PROVIDER,
         prompt_id=prompt_id,
-        prompt_version=None,
-        raw_actions_text=raw_actions_text,
+        answer_text=answer_text,
         raw_response=raw_response,
     )
 
 
-def _detect_actions_sync(
-    incoming_text: str,
-    prompt_id: str,
-) -> object:
+def _answer_question_sync(question_to_answer: str, prompt_id: str) -> object:
     try:
         from openai import OpenAI
     except ImportError as exc:
@@ -79,7 +85,7 @@ def _detect_actions_sync(
         prompt={
             "id": prompt_id,
             "variables": {
-                "incoming_text": incoming_text,
+                "question_to_answer": question_to_answer,
             },
         }
     )
@@ -94,29 +100,29 @@ def _extract_response_text(response: object) -> str:
             text = _extract_text_from_output(response)
     text = (text or "").strip()
     if not text:
-        raise RetryableJobError("OpenAI action detection returned no output text")
+        raise RetryableJobError("OpenAI question answering returned no output text")
     return text
 
 
-def _extract_actions_text(response_text: object) -> str:
+def _extract_answer_block(response_text: object) -> str:
     text = str(response_text).strip()
-    fenced_text = _strip_single_json_code_fence(text)
-    return fenced_text if fenced_text is not None else text
-
-
-def _strip_single_json_code_fence(text: str) -> str | None:
     lines = text.splitlines()
-    if len(lines) < 3:
-        return None
-    first = lines[0].strip().lower()
-    last = lines[-1].strip()
-    if not first.startswith("```") or last != "```":
-        return None
-    fence_language = first[3:].strip()
-    if fence_language not in {"", "json", "json_block"}:
-        return None
-    body = "\n".join(lines[1:-1]).strip()
-    return body or None
+    start_index: int | None = None
+    for index, line in enumerate(lines):
+        if line.strip().lower() == "```answer":
+            start_index = index + 1
+            break
+    if start_index is None:
+        raise RetryableJobError("OpenAI question answering response missing answer block")
+
+    for end_index in range(start_index, len(lines)):
+        if lines[end_index].strip() == "```":
+            answer = "\n".join(lines[start_index:end_index]).strip()
+            if not answer:
+                raise RetryableJobError("OpenAI question answering returned empty answer block")
+            return answer
+
+    raise RetryableJobError("OpenAI question answering answer block was not closed")
 
 
 def _extract_text_from_output(response: object) -> str:
@@ -140,11 +146,11 @@ def _summarize_response(
     response: object,
     *,
     response_text: str,
-    raw_actions_text: str,
+    answer_text: str,
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "output_text": response_text,
-        "raw_actions_text": raw_actions_text,
+        "answer_text": answer_text,
     }
     for field_name in ("id", "model", "status", "created_at"):
         value = _json_safe(_get_field(response, field_name))
@@ -161,7 +167,7 @@ def _job_error_from_openai_error(exc: Exception) -> Exception:
     try:
         import openai
     except ImportError:
-        return RetryableJobError(f"OpenAI action detection failed: {exc}")
+        return RetryableJobError(f"OpenAI question answering failed: {exc}")
 
     if isinstance(
         exc,
@@ -173,31 +179,31 @@ def _job_error_from_openai_error(exc: Exception) -> Exception:
         ),
     ):
         log.debug(
-            "OpenAI action detection retryable failure error_class=%s error=%s",
+            "OpenAI question answering retryable failure error_class=%s error=%s",
             exc.__class__.__name__,
             exc,
         )
-        return RetryableJobError(f"OpenAI action detection failed: {exc}")
+        return RetryableJobError(f"OpenAI question answering failed: {exc}")
 
     if isinstance(exc, openai.APIStatusError):
         status_code = exc.status_code
         log.debug(
-            "OpenAI action detection status failure status_code=%s error_class=%s error=%s",
+            "OpenAI question answering status failure status_code=%s error_class=%s error=%s",
             status_code,
             exc.__class__.__name__,
             exc,
         )
-        message = f"OpenAI action detection API error status={status_code}: {exc}"
+        message = f"OpenAI question answering API error status={status_code}: {exc}"
         if status_code in {408, 409, 429} or status_code >= 500:
             return RetryableJobError(message)
         return PermanentJobError(message)
 
     log.debug(
-        "OpenAI action detection unexpected failure error_class=%s error=%s",
+        "OpenAI question answering unexpected failure error_class=%s error=%s",
         exc.__class__.__name__,
         exc,
     )
-    return RetryableJobError(f"OpenAI action detection failed: {exc}")
+    return RetryableJobError(f"OpenAI question answering failed: {exc}")
 
 
 def _get_field(value: object, field_name: str) -> Any:

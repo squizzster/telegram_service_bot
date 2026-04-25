@@ -11,7 +11,6 @@ from bot_libs.action_detection_openai import (
     OPENAI_ACTION_DETECTION_PROVIDER,
     detect_actions_with_openai,
     resolve_openai_action_prompt_id,
-    resolve_openai_action_prompt_version,
 )
 from bot_libs.action_detection_validation import validate_provider_actions
 from bot_libs.action_models import (
@@ -46,7 +45,7 @@ class ActionDetectionService:
         self.provider = provider
         self.provider_name = provider_name
         self.prompt_id = prompt_id or resolve_openai_action_prompt_id()
-        self.prompt_version = prompt_version or resolve_openai_action_prompt_version()
+        self.prompt_version = prompt_version
 
     async def detect_actions(self, row: Mapping[str, object]) -> dict[str, Any]:
         queue_id = _row_int(row, "id")
@@ -70,11 +69,10 @@ class ActionDetectionService:
         incoming_text_sha256 = hashlib.sha256(incoming_text.encode("utf-8")).hexdigest()
         log.debug(
             "Action detection starting queue_id=%s provider=%s prompt_id=%s "
-            "prompt_version=%s chars=%s sha256=%s",
+            "chars=%s sha256=%s",
             queue_id,
             self.provider_name,
             self.prompt_id,
-            self.prompt_version,
             len(incoming_text),
             incoming_text_sha256,
         )

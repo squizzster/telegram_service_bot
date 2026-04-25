@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 
 from bot_libs.action_detection import ActionDetectionService
 from bot_libs.action_models import (
+    ACTION_ANSWER_QUESTION,
     ACTION_DETECTION_COMPLETE,
     ACTION_DETECTION_PENDING,
     ACTION_LOG_EXPENSES,
@@ -83,6 +84,30 @@ class ActionDetectionServiceTests(unittest.IsolatedAsyncioTestCase):
             actions = store.get_actions_for_queue_job(int(insert_result.queue_id))
             self.assertEqual(len(actions), 1)
             self.assertEqual(actions[0]["action_code"], ACTION_LOG_EXPENSES)
+
+    async def test_detect_actions_creates_question_action_job(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.sqlite"
+            store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
+            store.create_schema(create_parent_dir=True)
+            insert_result = store.insert_queue_job(make_job())
+            self.assertIsNotNone(insert_result.queue_id)
+            row = store.get_queue_job(int(insert_result.queue_id))
+            self.assertIsNotNone(row)
+            provider = FakeProvider('["asking_a_question"]')
+            service = ActionDetectionService(
+                queue_store=store,
+                provider=provider,
+                provider_name="fake",
+                prompt_id="prompt",
+            )
+
+            result = await service.detect_actions(row)
+
+            self.assertEqual(result["action_codes"], [ACTION_ANSWER_QUESTION])
+            actions = store.get_actions_for_queue_job(int(insert_result.queue_id))
+            self.assertEqual(len(actions), 1)
+            self.assertEqual(actions[0]["action_code"], ACTION_ANSWER_QUESTION)
 
     async def test_complete_detection_skips_provider(self) -> None:
         with TemporaryDirectory() as tmpdir:

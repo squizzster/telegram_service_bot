@@ -110,6 +110,40 @@ class RuntimeChecksTests(unittest.IsolatedAsyncioTestCase):
         os.environ,
         {
             "TELEGRAM_BOT_KEY": "telegram-token",
+            "SQL_TELEGRAM_FILE": "/home/auto_charles/telegram/db/test.sqlite",
+            "OPENAI_API_KEY": "openai-key",
+        },
+        clear=True,
+    )
+    @patch("bot_libs.runtime_checks._check_credentials", new_callable=AsyncMock)
+    @patch("bot_libs.runtime_checks._check_commands", return_value=[])
+    @patch("bot_libs.runtime_checks._check_imports", return_value=[])
+    async def test_action_daemon_runtime_checks_use_minimal_profile(
+        self,
+        check_imports: object,
+        check_commands: object,
+        check_credentials: AsyncMock,
+    ) -> None:
+        del check_imports, check_commands
+        check_credentials.return_value = []
+
+        report = await run_runtime_system_checks(component="action-daemon")
+
+        self.assertEqual(
+            report.env_vars_checked,
+            ("TELEGRAM_BOT_KEY", "SQL_TELEGRAM_FILE", "OPENAI_API_KEY"),
+        )
+        self.assertEqual(report.commands_checked, ())
+        self.assertEqual(report.credentials_checked, ("telegram", "OPEN_AI"))
+        check_credentials.assert_awaited_once_with(
+            timeout_seconds=10.0,
+            credential_labels=("telegram", "OPEN_AI"),
+        )
+
+    @patch.dict(
+        os.environ,
+        {
+            "TELEGRAM_BOT_KEY": "telegram-token",
             "TELEGRAM_WEBHOOK_SECRET": "webhook-secret",
             "SQL_TELEGRAM_FILE": "/home/auto_charles/telegram/db/test.sqlite",
             "OPENAI_API_KEY": "openai-key",

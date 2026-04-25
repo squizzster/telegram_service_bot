@@ -392,6 +392,7 @@ class TelegramQueueDaemonTests(unittest.IsolatedAsyncioTestCase):
             stale_lock_seconds=1800,
             queue_max_attempts=daemon.DEFAULT_MAX_ATTEMPTS,
             pidfile_path="/tmp/test-telegram-queue-daemon.pid",
+            action_daemon_pidfile_path="/tmp/test-telegram-action-daemon.pid",
         )
 
     def make_row(

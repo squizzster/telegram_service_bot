@@ -5,9 +5,11 @@ from dataclasses import replace
 
 from bot_libs.action_detection_validation import validate_provider_actions
 from bot_libs.action_models import (
+    ACTION_ANSWER_QUESTION,
     ACTION_LOG_EXPENSES,
     ACTION_LOG_INCOME,
     ACTION_NONE,
+    ACTION_PROVIDER_ASKING_A_QUESTION,
     ACTION_PROVIDER_LOG_EXPENSES,
     ACTION_PROVIDER_LOG_INCOME,
     ACTION_PROVIDER_NONE,
@@ -52,12 +54,18 @@ def catalog() -> dict[str, ActionCatalogEntry]:
         code=ACTION_LOG_INCOME,
         provider_label=ACTION_PROVIDER_LOG_INCOME,
     )
+    question = entry(
+        id=4,
+        code=ACTION_ANSWER_QUESTION,
+        provider_label=ACTION_PROVIDER_ASKING_A_QUESTION,
+    )
     return {
         item.provider_label: item
         for item in (
             none,
             expenses,
             income,
+            question,
         )
     }
 
@@ -77,6 +85,19 @@ class ActionDetectionValidationTests(unittest.TestCase):
             result.action_codes,
             (ACTION_LOG_INCOME, ACTION_LOG_EXPENSES),
         )
+        self.assertFalse(result.none)
+
+    def test_question_action_maps_to_internal_code(self) -> None:
+        result = validate_provider_actions(
+            '["asking_a_question"]',
+            catalog_by_provider_label=catalog(),
+        )
+
+        self.assertEqual(
+            result.provider_labels,
+            (ACTION_PROVIDER_ASKING_A_QUESTION,),
+        )
+        self.assertEqual(result.action_codes, (ACTION_ANSWER_QUESTION,))
         self.assertFalse(result.none)
 
     def test_none_is_valid_without_child_actions(self) -> None:

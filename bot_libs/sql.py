@@ -9,6 +9,11 @@ from typing import Any
 
 from bot_libs.action_models import (
     ACTION_CATALOG_SEED,
+    ACTION_STATUS_CANCELLED,
+    ACTION_STATUS_DEAD,
+    ACTION_STATUS_DONE,
+    ACTION_STATUS_PROCESSING,
+    ACTION_STATUS_QUEUED,
     ActionCatalogEntry,
     ACTION_DETECTION_COMPLETE,
     ACTION_DETECTION_FAILED,
@@ -26,13 +31,15 @@ from bot_libs.queue_models import (
     stable_json_dumps,
 )
 from bot_libs.stage_names import (
+    STAGE_CANCELLED,
     STAGE_DETECTING_ACTIONS,
     STAGE_DONE,
     STAGE_FAILED,
+    STAGE_PROCESSING_ACTION,
     STAGE_RETRY_WAITING,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 QUEUE_TABLE_NAME = "telegram_queue"
 ACTION_CATALOG_TABLE_NAME = "action_catalog"
 ACTION_DETECTION_RUNS_TABLE_NAME = "action_detection_runs"
@@ -1256,6 +1263,344 @@ class SQLiteQueueStore:
 
         return tuple(dict(row) for row in rows)
 
+    def get_next_action_available_at(self) -> datetime | None:
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT ima.available_at
+                    FROM incoming_message_actions AS ima
+                    JOIN telegram_queue AS tq
+                      ON tq.id = ima.queue_id
+                    WHERE ima.status = ?
+                      AND tq.status = ?
+                    ORDER BY ima.available_at, ima.queue_id, ima.detected_order, ima.id
+                    LIMIT 1
+                    """,
+                    (ACTION_STATUS_QUEUED, STATUS_DONE),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            raise self._coerce_sqlite_error(exc) from exc
+
+        if row is None or row["available_at"] is None:
+            return None
+        return _parse_sqlite_datetime(row["available_at"])
+
+    def get_action_job(self, action_job_id: int) -> dict[str, Any] | None:
+        try:
+            with self._connect() as conn:
+                row = _select_action_job(conn, action_job_id)
+        except sqlite3.Error as exc:
+            raise self._coerce_sqlite_error(exc) from exc
+
+        return dict(row) if row is not None else None
+
+    def claim_next_action(self, *, worker_name: str) -> dict[str, Any] | None:
+        conn: sqlite3.Connection | None = None
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    """
+                    SELECT ima.id
+                    FROM incoming_message_actions AS ima
+                    JOIN telegram_queue AS tq
+                      ON tq.id = ima.queue_id
+                    WHERE ima.status = ?
+                      AND ima.available_at <= CURRENT_TIMESTAMP
+                      AND tq.status = ?
+                    ORDER BY ima.available_at, ima.queue_id, ima.detected_order, ima.id
+                    LIMIT 1
+                    """,
+                    (ACTION_STATUS_QUEUED, STATUS_DONE),
+                ).fetchone()
+                if row is None:
+                    conn.commit()
+                    return None
+
+                conn.execute(
+                    """
+                    UPDATE incoming_message_actions
+                    SET
+                        status = ?,
+                        stage = ?,
+                        locked_at = CURRENT_TIMESTAMP,
+                        locked_by = ?,
+                        attempts = attempts + 1,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        ACTION_STATUS_PROCESSING,
+                        STAGE_PROCESSING_ACTION,
+                        worker_name,
+                        row["id"],
+                    ),
+                )
+                claimed_row = _select_action_job(conn, int(row["id"]))
+                conn.commit()
+        except sqlite3.Error as exc:
+            try:
+                if conn is not None:
+                    conn.rollback()
+            except Exception:
+                pass
+            raise self._coerce_sqlite_error(exc) from exc
+        except Exception:
+            try:
+                if conn is not None:
+                    conn.rollback()
+            except Exception:
+                pass
+            raise
+
+        return dict(claimed_row) if claimed_row is not None else None
+
+    def requeue_stale_processing_actions(
+        self,
+        *,
+        older_than_seconds: int,
+        worker_name: str | None = None,
+    ) -> int:
+        del worker_name
+
+        if older_than_seconds < 1:
+            raise ValueError("older_than_seconds must be >= 1")
+
+        stale_cutoff = _sqlite_timestamp(
+            datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)
+        )
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE incoming_message_actions
+                    SET
+                        status = ?,
+                        stage = ?,
+                        available_at = CURRENT_TIMESTAMP,
+                        locked_at = NULL,
+                        locked_by = NULL,
+                        last_error = ?,
+                        result_json = NULL,
+                        finished_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE status = ?
+                      AND (locked_at IS NULL OR locked_at <= ?)
+                    """,
+                    (
+                        ACTION_STATUS_QUEUED,
+                        STAGE_RETRY_WAITING,
+                        "stale_action_lock_recovered",
+                        ACTION_STATUS_PROCESSING,
+                        stale_cutoff,
+                    ),
+                )
+                conn.commit()
+        except sqlite3.Error as exc:
+            raise self._coerce_sqlite_error(exc) from exc
+
+        return int(cursor.rowcount)
+
+    def set_action_stage(self, action_job_id: int, *, stage: str) -> None:
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE incoming_message_actions
+                    SET
+                        stage = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (stage, action_job_id),
+                )
+                if cursor.rowcount != 1:
+                    raise QueueStoreError(f"Action job not found id={action_job_id}")
+                conn.commit()
+        except sqlite3.Error as exc:
+            raise self._coerce_sqlite_error(exc) from exc
+
+    def set_action_outbound_json(
+        self,
+        action_job_id: int,
+        *,
+        outbound_json: Any,
+        stage: str | None = None,
+    ) -> None:
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE incoming_message_actions
+                    SET
+                        outbound_json = ?,
+                        stage = COALESCE(?, stage),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        _normalize_json_text(outbound_json),
+                        stage,
+                        action_job_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise QueueStoreError(f"Action job not found id={action_job_id}")
+                conn.commit()
+        except sqlite3.Error as exc:
+            raise self._coerce_sqlite_error(exc) from exc
+
+    def mark_action_done(
+        self,
+        action_job_id: int,
+        *,
+        result_json: Any = None,
+        stage: str = STAGE_DONE,
+    ) -> None:
+        self._update_action_status(
+            action_job_id,
+            status=ACTION_STATUS_DONE,
+            stage=stage,
+            result_json=_normalize_json_text(result_json),
+            finished=True,
+            last_error=None,
+        )
+
+    def mark_action_for_retry(
+        self,
+        action_job_id: int,
+        *,
+        delay_seconds: int,
+        last_error: str,
+    ) -> None:
+        available_at = _sqlite_timestamp(
+            datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+        )
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE incoming_message_actions
+                    SET
+                        status = CASE
+                            WHEN attempts >= max_attempts THEN ?
+                            ELSE ?
+                        END,
+                        stage = CASE
+                            WHEN attempts >= max_attempts THEN ?
+                            ELSE ?
+                        END,
+                        available_at = CASE
+                            WHEN attempts >= max_attempts THEN available_at
+                            ELSE ?
+                        END,
+                        locked_at = NULL,
+                        locked_by = NULL,
+                        last_error = ?,
+                        result_json = NULL,
+                        finished_at = CASE
+                            WHEN attempts >= max_attempts THEN CURRENT_TIMESTAMP
+                            ELSE NULL
+                        END,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        ACTION_STATUS_DEAD,
+                        ACTION_STATUS_QUEUED,
+                        STAGE_FAILED,
+                        STAGE_RETRY_WAITING,
+                        available_at,
+                        last_error,
+                        action_job_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise QueueStoreError(
+                        f"Action job not found for retry id={action_job_id}"
+                    )
+                conn.commit()
+        except sqlite3.Error as exc:
+            raise self._coerce_sqlite_error(exc) from exc
+
+    def mark_action_dead(
+        self,
+        action_job_id: int,
+        *,
+        last_error: str,
+        result_json: Any = None,
+        stage: str = STAGE_FAILED,
+    ) -> None:
+        self._update_action_status(
+            action_job_id,
+            status=ACTION_STATUS_DEAD,
+            stage=stage,
+            result_json=_normalize_json_text(result_json),
+            finished=True,
+            last_error=last_error,
+        )
+
+    def mark_action_cancelled(
+        self,
+        action_job_id: int,
+        *,
+        result_json: Any = None,
+        stage: str = STAGE_CANCELLED,
+    ) -> None:
+        self._update_action_status(
+            action_job_id,
+            status=ACTION_STATUS_CANCELLED,
+            stage=stage,
+            result_json=_normalize_json_text(result_json),
+            finished=True,
+            last_error=None,
+        )
+
+    def _update_action_status(
+        self,
+        action_job_id: int,
+        *,
+        status: str,
+        stage: str,
+        result_json: str | None,
+        finished: bool,
+        last_error: str | None,
+    ) -> None:
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE incoming_message_actions
+                    SET
+                        status = ?,
+                        stage = ?,
+                        locked_at = NULL,
+                        locked_by = NULL,
+                        result_json = ?,
+                        last_error = ?,
+                        finished_at = CASE
+                            WHEN ? THEN CURRENT_TIMESTAMP
+                            ELSE finished_at
+                        END,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        status,
+                        stage,
+                        result_json,
+                        last_error,
+                        1 if finished else 0,
+                        action_job_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise QueueStoreError(f"Action job not found id={action_job_id}")
+                conn.commit()
+        except sqlite3.Error as exc:
+            raise self._coerce_sqlite_error(exc) from exc
+
     def requeue_stale_processing_jobs(
         self,
         *,
@@ -1892,6 +2237,34 @@ def _catalog_by_code(conn: sqlite3.Connection) -> dict[str, ActionCatalogEntry]:
         """
     ).fetchall()
     return {entry.code: entry for entry in (_action_catalog_entry(row) for row in rows)}
+
+
+def _select_action_job(
+    conn: sqlite3.Connection,
+    action_job_id: int,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT
+            ima.*,
+            tq.status AS source_status,
+            tq.stage AS source_stage,
+            tq.update_id AS source_update_id,
+            tq.chat_id AS chat_id,
+            tq.chat_type AS chat_type,
+            tq.message_id AS message_id,
+            tq.message_thread_id AS message_thread_id,
+            tq.processing_text AS processing_text,
+            tq.payload_json AS source_payload_json,
+            tq.raw_update_json AS source_raw_update_json,
+            tq.result_json AS source_result_json
+        FROM incoming_message_actions AS ima
+        JOIN telegram_queue AS tq
+          ON tq.id = ima.queue_id
+        WHERE ima.id = ?
+        """,
+        (action_job_id,),
+    ).fetchone()
 
 
 def _fail_action_detection_run(
