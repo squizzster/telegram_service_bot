@@ -1,0 +1,35 @@
+from __future__ import annotations
+
+STAGE_QUEUED = "QUEUED"
+STAGE_DOWNLOADING_FILE = "DOWNLOADING_FILE"
+STAGE_CALLING_STT_API = "CALLING_STT_API"
+STAGE_READY_TO_PROCESS = "READY_TO_PROCESS"
+STAGE_SENDING_RESPONSE = "SENDING_RESPONSE"
+STAGE_DONE = "DONE"
+STAGE_RETRY_WAITING = "RETRY_WAITING"
+STAGE_FAILED = "FAILED"
+STAGE_MESSAGE_REMOVED = "MESSAGE_REMOVED"
+STAGE_UNSUPPORTED = "UNSUPPORTED"
+
+KNOWN_STAGES = frozenset(
+    {
+        STAGE_QUEUED,
+        STAGE_DOWNLOADING_FILE,
+        STAGE_CALLING_STT_API,
+        STAGE_READY_TO_PROCESS,
+        STAGE_SENDING_RESPONSE,
+        STAGE_DONE,
+        STAGE_RETRY_WAITING,
+        STAGE_FAILED,
+        STAGE_MESSAGE_REMOVED,
+        STAGE_UNSUPPORTED,
+    }
+)
+
+
+def initial_stage_for_job(*, is_supported: bool, processing_text: str | None) -> str:
+    if not is_supported:
+        return STAGE_UNSUPPORTED
+    if processing_text:
+        return STAGE_READY_TO_PROCESS
+    return STAGE_QUEUED
