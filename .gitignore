@@ -1,0 +1,6 @@
+
+# Runtime / local artifact directories
+test_dump_json/
+audio_testing_files/
+back_ups/
+db/
