@@ -23,6 +23,9 @@ from bot_libs.queue_processors.audio_validation import (
 )
 from bot_libs.queue_processors.file_common import get_telegram_file_and_info
 from bot_libs.queue_processors.speech_to_text import transcribe_audio_bytes
+from bot_libs.action_models import (
+    ACTION_DETECTION_NOT_APPLICABLE,
+)
 from bot_libs.reaction_policy import (
     REACTION_CALLING_STT_API,
     REACTION_DOWNLOADING_FILE,
@@ -150,6 +153,21 @@ async def process_audio_like(
     duration_seconds = extra.get("duration_seconds") if isinstance(extra, dict) else None
     if not sending_stage_already_set:
         await _set_stage(context, STAGE_SENDING_RESPONSE)
+    if _should_defer_transcript_reply(row):
+        return {
+            "processor": processor_name,
+            **file_info,
+            "duration_seconds": duration_seconds,
+            "audio_duration_seconds": probed_duration_seconds,
+            "transcript_length": len(transcript),
+            "transcript_preview": transcript[:200],
+            "processing_text": transcript,
+            "transcript_provider": transcript_result.get("provider"),
+            "transcript_model": transcript_result["model_id"],
+            "transcript_message_ids": [],
+            "transcript_reply_deferred": True,
+        }
+
     transcript_message_ids = await _send_transcript_messages(
         bot,
         row,
@@ -169,6 +187,27 @@ async def process_audio_like(
         "transcript_model": transcript_result["model_id"],
         "transcript_message_ids": transcript_message_ids,
     }
+
+
+async def send_deferred_transcript_reply(
+    bot: Bot,
+    row: Mapping[str, object],
+    *,
+    action_detection_result: Mapping[str, object],
+    context: QueueProcessingContext | None = None,
+) -> list[int]:
+    transcript = _row_processing_text(row)
+    if transcript is None:
+        raise RetryableJobError("processing_text missing for deferred transcript send")
+
+    await _set_stage(context, STAGE_SENDING_RESPONSE)
+    return await _send_transcript_messages(
+        bot,
+        row,
+        transcript,
+        context=context,
+        action_labels=_action_labels_for_reply(action_detection_result),
+    )
 
 
 def _audio_validation_failure_message(reason: str) -> str:
@@ -242,6 +281,8 @@ async def _send_transcript_messages(
     row: Mapping[str, object],
     transcript: str,
     context: QueueProcessingContext | None,
+    *,
+    action_labels: list[str] | None = None,
 ) -> list[int]:
     chat_id = row.get("chat_id")
     if chat_id is None:
@@ -252,7 +293,10 @@ async def _send_transcript_messages(
     persisted_message_ids = _persisted_message_ids(transcript_state)
     message_thread_id = row.get("message_thread_id")
     source_message_id = row.get("message_id")
-    transcript_chunks = _build_transcript_chunks(transcript)
+    transcript_chunks = _build_transcript_chunks(
+        transcript,
+        action_labels=action_labels,
+    )
     sent_message_ids: list[int] = []
 
     for index, transcript_chunk in enumerate(transcript_chunks):
@@ -614,13 +658,24 @@ def _row_file_info(row: Mapping[str, object]) -> dict[str, object]:
     }
 
 
-def _build_transcript_chunks(transcript: str) -> list[str]:
+def _build_transcript_chunks(
+    transcript: str,
+    *,
+    action_labels: list[str] | None = None,
+) -> list[str]:
     transcript_text = transcript.strip()
     if not transcript_text:
-        return [TRANSCRIPT_PREFIX + "(empty transcript)"]
+        transcript_text = "(empty transcript)"
+
+    labels_line = _format_action_labels_line(action_labels)
+    if labels_line is not None:
+        transcript_text = f"{transcript_text}\n{labels_line}"
+        first_prefix = ""
+    else:
+        first_prefix = TRANSCRIPT_PREFIX
 
     chunks: list[str] = []
-    current_prefix = TRANSCRIPT_PREFIX
+    current_prefix = first_prefix
     remaining = transcript_text
 
     while remaining:
@@ -635,6 +690,42 @@ def _build_transcript_chunks(transcript: str) -> list[str]:
         current_prefix = CONTINUED_TRANSCRIPT_PREFIX
 
     return chunks
+
+
+def _should_defer_transcript_reply(row: Mapping[str, object]) -> bool:
+    status = row.get("action_detection_status")
+    if not isinstance(status, str):
+        return False
+    return status.strip() not in {"", ACTION_DETECTION_NOT_APPLICABLE}
+
+
+def _action_labels_for_reply(
+    action_detection_result: Mapping[str, object],
+) -> list[str]:
+    labels = action_detection_result.get("provider_labels")
+    if isinstance(labels, list):
+        return [str(label).strip() for label in labels if str(label).strip()]
+    if isinstance(labels, tuple):
+        return [str(label).strip() for label in labels if str(label).strip()]
+    if action_detection_result.get("none") is True:
+        return ["none"]
+    action_codes = action_detection_result.get("action_codes")
+    if isinstance(action_codes, (list, tuple)):
+        return [
+            str(action_code).strip()
+            for action_code in action_codes
+            if str(action_code).strip()
+        ]
+    return ["none"]
+
+
+def _format_action_labels_line(action_labels: list[str] | None) -> str | None:
+    if action_labels is None:
+        return None
+    labels = [label.strip() for label in action_labels if label.strip()]
+    if not labels:
+        labels = ["none"]
+    return "[" + ",".join(labels) + "]"
 
 
 def _find_split_index(text: str, limit: int) -> int:

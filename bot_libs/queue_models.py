@@ -6,6 +6,10 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Any, Mapping
 
+from bot_libs.action_models import (
+    ACTION_DETECTION_NOT_APPLICABLE,
+    initial_action_detection_status,
+)
 from bot_libs.retry_policy import DEFAULT_QUEUE_MAX_ATTEMPTS
 from bot_libs.stage_names import STAGE_QUEUED
 
@@ -157,8 +161,19 @@ class QueueJobData:
     text: str | None = None
     processing_text: str | None = None
     caption: str | None = None
+    action_detection_status: str | None = None
 
     def as_db_params(self) -> dict[str, Any]:
+        action_detection_status = self.action_detection_status
+        if action_detection_status is None:
+            action_detection_status = initial_action_detection_status(
+                content_type=self.content_type,
+                is_supported=self.is_supported,
+                processing_text=self.processing_text,
+            )
+        if not action_detection_status:
+            action_detection_status = ACTION_DETECTION_NOT_APPLICABLE
+
         return {
             "status": STATUS_QUEUED,
             "stage": self.stage,
@@ -192,6 +207,7 @@ class QueueJobData:
             "text": self.text,
             "processing_text": self.processing_text,
             "caption": self.caption,
+            "action_detection_status": action_detection_status,
             "payload_json": self.payload_json,
             "raw_update_json": self.raw_update_json,
             "max_attempts": self.max_attempts,

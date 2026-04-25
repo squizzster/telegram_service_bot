@@ -18,6 +18,7 @@ if __package__ in {None, ""}:
 
 from telegram import Bot  # noqa: E402
 
+from bot_libs.action_detection import ActionDetectionService  # noqa: E402
 from bot_libs.daemon_signal import (  # noqa: E402
     DAEMON_PROCESS_NAME,
     resolve_daemon_pidfile,
@@ -39,6 +40,9 @@ from bot_libs.queue_processor_errors import (  # noqa: E402
 )
 from bot_libs.queue_processors.dispatch import (  # noqa: E402
     DispatchingQueueJobProcessor,
+)
+from bot_libs.queue_processors.voice import (  # noqa: E402
+    send_deferred_transcript_reply,
 )
 from bot_libs.sql import (  # noqa: E402
     QueueStoreError,
@@ -159,10 +163,14 @@ class QueueDaemon:
         config: Config,
         queue_store: SQLiteQueueStore,
         processor: QueueJobProcessor | None = None,
+        action_detector: ActionDetectionService | None = None,
     ) -> None:
         self.config = config
         self.queue_store = queue_store
         self.processor = processor or DispatchingQueueJobProcessor()
+        self.action_detector = action_detector or ActionDetectionService(
+            queue_store=queue_store
+        )
         self._wake_event = asyncio.Event()
         self._pending_wakeups = 0
         self._stop_requested = False
@@ -309,6 +317,15 @@ class QueueDaemon:
                 row,
                 context=self._build_processing_context(job_id, bot=bot, row=row),
             )
+            latest_row = await asyncio.to_thread(self.queue_store.get_queue_job, job_id)
+            if latest_row is None:
+                raise RetryableJobError(
+                    f"queue job disappeared after processing id={job_id}"
+                )
+            action_result = await self._maybe_detect_actions(
+                latest_row,
+                processor_result=processor_result,
+            )
         except OriginalMessageUnavailableError as exc:
             log.debug(
                 "Source message unavailable queue_job_id=%s error=%s",
@@ -327,7 +344,7 @@ class QueueDaemon:
             return
         except PermanentJobError as exc:
             log.debug(
-                "Processor permanent failure queue_job_id=%s error_class=%s error=%s",
+                "Queue job permanent failure queue_job_id=%s error_class=%s error=%s",
                 job_id,
                 exc.__class__.__name__,
                 _error_text(exc),
@@ -342,7 +359,7 @@ class QueueDaemon:
             return
         except RetryableJobError as exc:
             log.debug(
-                "Processor retryable failure queue_job_id=%s error_class=%s error=%s",
+                "Queue job retryable failure queue_job_id=%s error_class=%s error=%s",
                 job_id,
                 exc.__class__.__name__,
                 _error_text(exc),
@@ -371,7 +388,67 @@ class QueueDaemon:
             )
             return
 
-        result_json = _normalize_success_result(processor_result, attempts=attempts)
+        try:
+            result_json = _normalize_success_result(processor_result, attempts=attempts)
+            result_json["action_detection"] = action_result
+            transcript_message_ids = await self._maybe_send_deferred_transcript_reply(
+                bot,
+                job_id=job_id,
+                processor_result=processor_result,
+                action_result=action_result,
+            )
+            if transcript_message_ids is not None:
+                result_json["transcript_message_ids"] = transcript_message_ids
+        except OriginalMessageUnavailableError as exc:
+            log.debug(
+                "Source message unavailable during deferred transcript send "
+                "queue_job_id=%s error=%s",
+                job_id,
+                _error_text(exc),
+            )
+            await self._mark_dead(
+                bot,
+                row,
+                failure_class="deleted_message",
+                last_error=_error_text(exc),
+                attempts=attempts,
+                stage=STAGE_MESSAGE_REMOVED,
+                send_failure_reaction=False,
+            )
+            return
+        except PermanentJobError as exc:
+            log.debug(
+                "Deferred transcript send permanent failure queue_job_id=%s "
+                "error_class=%s error=%s",
+                job_id,
+                exc.__class__.__name__,
+                _error_text(exc),
+            )
+            await self._mark_dead(
+                bot,
+                row,
+                failure_class="permanent_failure",
+                last_error=_error_text(exc),
+                attempts=attempts,
+            )
+            return
+        except RetryableJobError as exc:
+            log.debug(
+                "Deferred transcript send retryable failure queue_job_id=%s "
+                "error_class=%s error=%s",
+                job_id,
+                exc.__class__.__name__,
+                _error_text(exc),
+            )
+            await self._handle_retryable_failure(
+                bot,
+                row,
+                last_error=_error_text(exc),
+                attempts=attempts,
+                max_attempts=max_attempts,
+                retry_after_seconds=exc.retry_after_seconds,
+            )
+            return
         try:
             await asyncio.to_thread(
                 self.queue_store.mark_job_done,
@@ -387,7 +464,7 @@ class QueueDaemon:
             return
         reaction_set = await set_row_reaction(
             bot,
-            row,
+            latest_row,
             REACTION_SUCCESS,
             reason="processed_done",
         )
@@ -397,7 +474,11 @@ class QueueDaemon:
                 job_id,
                 REACTION_SUCCESS,
             )
-        self._schedule_reaction_reconcile(bot, row, reason="processed_done_confirm")
+        self._schedule_reaction_reconcile(
+            bot,
+            latest_row,
+            reason="processed_done_confirm",
+        )
         log.info(
             "Marked queue job done id=%s attempts=%s processor=%s",
             job_id,
@@ -407,6 +488,39 @@ class QueueDaemon:
         await self._make_retry_waiting_jobs_due_after_success(
             job_id,
             content_type=content_type,
+        )
+
+    async def _maybe_detect_actions(
+        self,
+        row: dict[str, object],
+        *,
+        processor_result: Mapping[str, object],
+    ) -> dict[str, object]:
+        del processor_result
+        return await self.action_detector.detect_actions(row)
+
+    async def _maybe_send_deferred_transcript_reply(
+        self,
+        bot: Bot,
+        *,
+        job_id: int,
+        processor_result: Mapping[str, object],
+        action_result: Mapping[str, object],
+    ) -> list[int] | None:
+        if processor_result.get("transcript_reply_deferred") is not True:
+            return None
+
+        latest_row = await asyncio.to_thread(self.queue_store.get_queue_job, job_id)
+        if latest_row is None:
+            raise RetryableJobError(
+                f"queue job disappeared before deferred transcript send id={job_id}"
+            )
+
+        return await send_deferred_transcript_reply(
+            bot,
+            latest_row,
+            action_detection_result=action_result,
+            context=self._build_processing_context(job_id, bot=bot, row=latest_row),
         )
 
     async def wait_for_wakeup(self) -> None:

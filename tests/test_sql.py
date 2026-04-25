@@ -2,17 +2,28 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from bot_libs.queue_models import (
     CONTENT_TYPE_AUDIO,
+    CONTENT_TYPE_PHOTO,
     CONTENT_TYPE_TEXT,
     STATUS_DEAD,
     STATUS_PROCESSING,
     STATUS_QUEUED,
     QueueJobData,
+)
+from bot_libs.action_models import (
+    ACTION_DETECTION_COMPLETE,
+    ACTION_DETECTION_PENDING,
+    ACTION_DETECTION_PROCESSING,
+    ACTION_LOG_EXPENSES,
+    ACTION_LOG_INCOME,
+    ACTION_PROVIDER_LOG_EXPENSES,
+    ACTION_PROVIDER_LOG_INCOME,
 )
 from bot_libs.stage_names import STAGE_MESSAGE_REMOVED, STAGE_RETRY_WAITING
 from bot_libs.sql import (
@@ -30,6 +41,8 @@ def make_job(
     message_id: int = 456,
     max_attempts: int = 3,
     content_type: str = CONTENT_TYPE_TEXT,
+    is_supported: bool = True,
+    processing_text: str | None = None,
 ) -> QueueJobData:
     return QueueJobData(
         update_id=update_id,
@@ -37,8 +50,9 @@ def make_job(
         message_id=message_id,
         telegram_date="2026-04-23T18:42:37+00:00",
         content_type=content_type,
-        is_supported=True,
+        is_supported=is_supported,
         text="hello",
+        processing_text=processing_text,
         payload_json="{}",
         raw_update_json="{}",
         max_attempts=max_attempts,
@@ -120,6 +134,53 @@ class SQLiteQueueStoreTests(unittest.TestCase):
             with sqlite3.connect(db_path) as conn:
                 row_count = conn.execute("SELECT COUNT(*) FROM telegram_queue").fetchone()[0]
             self.assertEqual(row_count, 0)
+
+    def test_schema_creates_seeded_action_catalog(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.sqlite"
+            store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
+            store.create_schema(create_parent_dir=True)
+
+            catalog_by_label = store.get_action_catalog_by_provider_label()
+            catalog_by_code = store.get_action_catalog_by_code()
+            check = store.verify_schema()
+
+            self.assertTrue(check.ok)
+            self.assertIn(ACTION_PROVIDER_LOG_EXPENSES, catalog_by_label)
+            self.assertIn(ACTION_LOG_EXPENSES, catalog_by_code)
+            self.assertFalse(catalog_by_code["NONE"].is_executable)
+            self.assertTrue(catalog_by_code[ACTION_LOG_INCOME].is_enabled)
+
+    def test_insert_queue_job_sets_initial_action_detection_status(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.sqlite"
+            store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
+            store.create_schema(create_parent_dir=True)
+            text_insert = store.insert_queue_job(
+                make_job(update_id=1, content_type=CONTENT_TYPE_TEXT)
+            )
+            photo_insert = store.insert_queue_job(
+                make_job(update_id=2, message_id=457, content_type=CONTENT_TYPE_PHOTO)
+            )
+            unsupported_insert = store.insert_queue_job(
+                make_job(
+                    update_id=3,
+                    message_id=458,
+                    content_type=CONTENT_TYPE_TEXT,
+                    is_supported=False,
+                )
+            )
+
+            text_row = fetch_row(db_path, text_insert.queue_id)
+            photo_row = fetch_row(db_path, photo_insert.queue_id)
+            unsupported_row = fetch_row(db_path, unsupported_insert.queue_id)
+
+            self.assertEqual(text_row["action_detection_status"], "pending")
+            self.assertEqual(photo_row["action_detection_status"], "not_applicable")
+            self.assertEqual(
+                unsupported_row["action_detection_status"],
+                "not_applicable",
+            )
 
     def test_create_schema_does_not_drop_wrong_existing_schema(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -469,3 +530,153 @@ class SQLiteQueueStoreTests(unittest.TestCase):
             )
             self.assertEqual(row["stage"], STAGE_RETRY_WAITING)
             self.assertEqual(row["stage_detail"], "testing")
+
+    def test_complete_action_detection_inserts_child_actions_idempotently(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.sqlite"
+            store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
+            store.create_schema(create_parent_dir=True)
+            insert_result = store.insert_queue_job(
+                make_job(processing_text="I spent 30 and earned 250")
+            )
+            self.assertIsNotNone(insert_result.queue_id)
+            queue_id = int(insert_result.queue_id)
+
+            first_run_id = store.start_action_detection_run(
+                queue_id=queue_id,
+                provider="openai",
+                prompt_id="prompt",
+                prompt_version="3",
+                incoming_text_chars=29,
+                incoming_text_sha256="abc",
+            )
+            first_result = store.complete_action_detection(
+                queue_id=queue_id,
+                detection_run_id=first_run_id,
+                raw_response_json={"output_text": '["reporting_expenses"]'},
+                normalized_actions_json={
+                    "status": ACTION_DETECTION_COMPLETE,
+                    "provider_labels": [
+                        ACTION_PROVIDER_LOG_EXPENSES,
+                        ACTION_PROVIDER_LOG_INCOME,
+                    ],
+                    "action_codes": [ACTION_LOG_EXPENSES, ACTION_LOG_INCOME],
+                    "none": False,
+                },
+                action_codes=(ACTION_LOG_EXPENSES, ACTION_LOG_INCOME),
+            )
+            second_run_id = store.start_action_detection_run(
+                queue_id=queue_id,
+                provider="openai",
+                prompt_id="prompt",
+                prompt_version="3",
+                incoming_text_chars=29,
+                incoming_text_sha256="abc",
+            )
+            second_result = store.complete_action_detection(
+                queue_id=queue_id,
+                detection_run_id=second_run_id,
+                raw_response_json={"output_text": '["reporting_expenses"]'},
+                normalized_actions_json={
+                    "status": ACTION_DETECTION_COMPLETE,
+                    "provider_labels": [ACTION_PROVIDER_LOG_EXPENSES],
+                    "action_codes": [ACTION_LOG_EXPENSES],
+                    "none": False,
+                },
+                action_codes=(ACTION_LOG_EXPENSES,),
+            )
+
+            row = fetch_row(db_path, queue_id)
+            actions = store.get_actions_for_queue_job(queue_id)
+            stored_result = json.loads(row["action_detection_result_json"])
+
+            self.assertEqual(first_result["created_action_count"], 2)
+            self.assertEqual(second_result["created_action_count"], 0)
+            self.assertEqual(row["action_detection_status"], ACTION_DETECTION_COMPLETE)
+            self.assertEqual(stored_result["detection_run_id"], second_run_id)
+            self.assertEqual(
+                [action["action_code"] for action in actions],
+                [ACTION_LOG_EXPENSES, ACTION_LOG_INCOME],
+            )
+
+    def test_complete_action_detection_none_creates_no_child_actions(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.sqlite"
+            store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
+            store.create_schema(create_parent_dir=True)
+            insert_result = store.insert_queue_job(make_job(processing_text="thanks"))
+            self.assertIsNotNone(insert_result.queue_id)
+            queue_id = int(insert_result.queue_id)
+            run_id = store.start_action_detection_run(
+                queue_id=queue_id,
+                provider="openai",
+                prompt_id="prompt",
+                prompt_version="3",
+                incoming_text_chars=6,
+                incoming_text_sha256="abc",
+            )
+
+            result = store.complete_action_detection(
+                queue_id=queue_id,
+                detection_run_id=run_id,
+                raw_response_json={"output_text": '["none"]'},
+                normalized_actions_json={
+                    "status": ACTION_DETECTION_COMPLETE,
+                    "provider_labels": ["none"],
+                    "action_codes": [],
+                    "none": True,
+                },
+                action_codes=(),
+            )
+
+            self.assertEqual(result["created_action_count"], 0)
+            self.assertEqual(store.get_actions_for_queue_job(queue_id), ())
+
+    def test_requeue_stale_processing_jobs_resets_action_detection_processing(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.sqlite"
+            store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
+            store.create_schema(create_parent_dir=True)
+            insert_result = store.insert_queue_job(make_job())
+            self.assertIsNotNone(insert_result.queue_id)
+
+            claimed = store.claim_next_job(worker_name="worker-1")
+            self.assertIsNotNone(claimed)
+            store.mark_action_detection_processing(claimed["id"])
+            run_id = store.start_action_detection_run(
+                queue_id=claimed["id"],
+                provider="openai",
+                prompt_id="prompt",
+                prompt_version="3",
+                incoming_text_chars=5,
+                incoming_text_sha256="abc",
+            )
+
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE telegram_queue
+                    SET locked_at = ?
+                    WHERE id = ?
+                    """,
+                    ("2000-01-01 00:00:00", claimed["id"]),
+                )
+                conn.commit()
+
+            recovered = store.requeue_stale_processing_jobs(
+                older_than_seconds=30,
+                worker_name="worker-2",
+            )
+            row = fetch_row(db_path, claimed["id"])
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                run_row = conn.execute(
+                    "SELECT * FROM action_detection_runs WHERE id = ?",
+                    (run_id,),
+                ).fetchone()
+
+            self.assertEqual(recovered, 1)
+            self.assertEqual(row["status"], STATUS_QUEUED)
+            self.assertEqual(row["action_detection_status"], ACTION_DETECTION_PENDING)
+            self.assertEqual(run_row["status"], "failed")
+            self.assertEqual(run_row["error"], "stale_processing_recovered")

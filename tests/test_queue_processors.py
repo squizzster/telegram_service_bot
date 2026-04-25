@@ -993,6 +993,76 @@ class VoiceProcessorTests(unittest.IsolatedAsyncioTestCase):
 
     @patch("bot_libs.queue_processors.voice.transcribe_audio_bytes")
     @patch("bot_libs.queue_processors.voice.probe_audio_duration_seconds")
+    async def test_voice_process_defers_transcript_reply_for_action_detection(
+        self,
+        probe_duration: object,
+        transcribe: object,
+    ) -> None:
+        probe_duration.return_value = 7
+        transcribe.return_value = {
+            "provider": "deepgram",
+            "model_id": "gemini-3-flash-preview",
+            "transcript": "hello world",
+        }
+        events: list[tuple[str, object, object, object]] = []
+
+        async def set_stage(stage: str, stage_detail: str | None) -> None:
+            events.append(("stage", stage, stage_detail, None))
+
+        async def set_processing_text(
+            processing_text: str,
+            stage: str | None,
+            stage_detail: str | None,
+        ) -> None:
+            events.append(("processing_text", processing_text, stage, stage_detail))
+
+        async def set_outbound_json(
+            outbound_json: dict[str, object],
+            stage: str | None,
+            stage_detail: str | None,
+        ) -> None:
+            events.append(("outbound_json", outbound_json, stage, stage_detail))
+
+        context = QueueProcessingContext(
+            set_stage=set_stage,
+            set_processing_text=set_processing_text,
+            set_outbound_json=set_outbound_json,
+        )
+        tg_file = SimpleNamespace(
+            file_path="voice/file_1.ogg",
+            download_as_bytearray=AsyncMock(return_value=bytearray(b"ogg-bytes")),
+        )
+        bot = SimpleNamespace(
+            get_file=AsyncMock(return_value=tg_file),
+            send_message=AsyncMock(),
+            set_message_reaction=AsyncMock(),
+        )
+
+        result = await process_voice(
+            bot,
+            {
+                "chat_id": 123,
+                "message_id": 456,
+                "chat_type": "supergroup",
+                "file_id": "voice-file-id",
+                "mime_type": "audio/ogg",
+                "action_detection_status": "pending",
+            },
+            {"extra": {"duration_seconds": 7}},
+            context=context,
+        )
+
+        self.assertTrue(result["transcript_reply_deferred"])
+        self.assertEqual(result["transcript_message_ids"], [])
+        self.assertEqual(result["processing_text"], "hello world")
+        bot.send_message.assert_not_awaited()
+        self.assertIn(
+            ("processing_text", "hello world", STAGE_SENDING_RESPONSE, None),
+            events,
+        )
+
+    @patch("bot_libs.queue_processors.voice.transcribe_audio_bytes")
+    @patch("bot_libs.queue_processors.voice.probe_audio_duration_seconds")
     async def test_voice_process_stops_before_stt_when_reaction_says_source_is_gone(
         self,
         probe_duration: object,

@@ -15,6 +15,7 @@ from bot_libs import (
     video_note_message,
     voice_message,
 )
+from bot_libs.action_models import initial_action_detection_status
 from bot_libs.queue_models import (
     CONTENT_TYPE_UNKNOWN,
     CONTENT_TYPE_TEXT,
@@ -67,6 +68,11 @@ def extract_queue_job(update: Update, *, max_attempts: int) -> QueueJobData | No
 
     content = _extract_message_content(message)
     processing_text = content.text if content.content_type == CONTENT_TYPE_TEXT else None
+    action_detection_status = initial_action_detection_status(
+        content_type=content.content_type,
+        is_supported=content.is_supported,
+        processing_text=processing_text,
+    )
     stage = initial_stage_for_job(
         is_supported=content.is_supported,
         processing_text=processing_text,
@@ -103,6 +109,7 @@ def extract_queue_job(update: Update, *, max_attempts: int) -> QueueJobData | No
             "text": content.text,
             "caption": content.caption,
             "processing_text": processing_text,
+            "action_detection_status": action_detection_status,
         },
         "file": {
             "file_id": content.file_details.file_id,
@@ -148,6 +155,7 @@ def extract_queue_job(update: Update, *, max_attempts: int) -> QueueJobData | No
         text=content.text,
         processing_text=processing_text,
         caption=content.caption,
+        action_detection_status=action_detection_status,
         payload_json=stable_json_dumps(payload),
         raw_update_json=stable_json_dumps(update.to_dict()),
         max_attempts=max_attempts,

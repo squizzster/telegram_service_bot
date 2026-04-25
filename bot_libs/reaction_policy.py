@@ -17,6 +17,7 @@ from bot_libs.queue_models import STATUS_DEAD, STATUS_DONE
 from bot_libs.retry_policy import RETRY_MEDIUM_MAX_SECONDS, RETRY_SHORT_MAX_SECONDS
 from bot_libs.stage_names import (
     STAGE_CALLING_STT_API,
+    STAGE_DETECTING_ACTIONS,
     STAGE_DONE,
     STAGE_DOWNLOADING_FILE,
     STAGE_FAILED,
@@ -166,7 +167,7 @@ def reaction_for_row_state(row: Mapping[str, object]) -> str | None:
         return retry_reaction_for_delay(_retry_delay_seconds_from_row(row))
     if stage == STAGE_DOWNLOADING_FILE:
         return REACTION_DOWNLOADING_FILE
-    if stage in {STAGE_CALLING_STT_API, STAGE_SENDING_RESPONSE}:
+    if stage in {STAGE_CALLING_STT_API, STAGE_SENDING_RESPONSE, STAGE_DETECTING_ACTIONS}:
         return REACTION_CALLING_STT_API
     if stage in {STAGE_QUEUED, STAGE_READY_TO_PROCESS, None}:
         return REACTION_ACCEPTED

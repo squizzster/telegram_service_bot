@@ -11,6 +11,7 @@ from bot_libs.stage_names import (
     STAGE_CALLING_STT_API,
     STAGE_FAILED,
     STAGE_MESSAGE_REMOVED,
+    STAGE_SENDING_RESPONSE,
     STAGE_UNSUPPORTED,
 )
 import telegram_queue_daemon as daemon
@@ -18,6 +19,19 @@ import telegram_queue_daemon as daemon
 
 async def immediate_to_thread(func, *args, **kwargs):
     return func(*args, **kwargs)
+
+
+def telegram_sent_message(
+    message_id: int,
+    *,
+    reply_to_message_id: int | None = None,
+) -> SimpleNamespace:
+    reply_to_message = (
+        SimpleNamespace(message_id=reply_to_message_id)
+        if reply_to_message_id is not None
+        else None
+    )
+    return SimpleNamespace(message_id=message_id, reply_to_message=reply_to_message)
 
 
 class FakeQueueStore:
@@ -131,7 +145,23 @@ class FakeQueueStore:
         stage: str | None = None,
         stage_detail: str | None = None,
     ) -> None:
-        del job_id, processing_text, stage, stage_detail
+        row = self.rows.setdefault(
+            job_id,
+            {
+                "id": job_id,
+                "status": "processing",
+                "stage": "READY_TO_PROCESS",
+                "is_supported": 1,
+                "chat_id": -1003986727769,
+                "chat_type": "supergroup",
+                "message_id": 41,
+                "action_detection_status": "not_applicable",
+            },
+        )
+        row["processing_text"] = processing_text
+        if stage is not None:
+            row["stage"] = stage
+        row["stage_detail"] = stage_detail
 
     def set_job_outbound_json(
         self,
@@ -149,6 +179,24 @@ class FakeQueueStore:
                 "stage_detail": stage_detail,
             }
         )
+        row = self.rows.setdefault(
+            job_id,
+            {
+                "id": job_id,
+                "status": "processing",
+                "stage": "READY_TO_PROCESS",
+                "is_supported": 1,
+                "chat_id": -1003986727769,
+                "chat_type": "supergroup",
+                "message_id": 41,
+                "processing_text": "hello world",
+                "action_detection_status": "pending",
+            },
+        )
+        row["outbound_json"] = json.dumps(outbound_json)
+        if stage is not None:
+            row["stage"] = stage
+        row["stage_detail"] = stage_detail
 
     def make_retry_waiting_jobs_due(
         self,
@@ -169,6 +217,18 @@ class FakeQueueStore:
         return 2
 
     def get_queue_job(self, job_id: int) -> dict[str, object] | None:
+        if job_id not in self.rows:
+            self.rows[job_id] = {
+                "id": job_id,
+                "status": "processing",
+                "stage": "READY_TO_PROCESS",
+                "is_supported": 1,
+                "chat_id": -1003986727769,
+                "chat_type": "supergroup",
+                "message_id": 41,
+                "processing_text": "hello world",
+                "action_detection_status": "not_applicable",
+            }
         return self.rows.get(job_id)
 
 
@@ -251,6 +311,67 @@ class ActivityProcessor(daemon.QueueJobProcessor):
             }
 
 
+class SaveProcessingTextProcessor(daemon.QueueJobProcessor):
+    async def process(
+        self,
+        bot: object,
+        row: dict[str, object],
+        *,
+        context: object = None,
+    ) -> dict[str, object]:
+        del bot, row
+        await context.set_processing_text("fresh canonical text", None, None)
+        return {
+            "outcome": "processed",
+            "processor": "save-text",
+        }
+
+
+class DeferredTranscriptProcessor(daemon.QueueJobProcessor):
+    async def process(
+        self,
+        bot: object,
+        row: dict[str, object],
+        *,
+        context: object = None,
+    ) -> dict[str, object]:
+        del bot, row
+        await context.set_processing_text(
+            "voice transcript",
+            STAGE_SENDING_RESPONSE,
+            None,
+        )
+        return {
+            "outcome": "processed",
+            "processor": "voice",
+            "processing_text": "voice transcript",
+            "transcript_message_ids": [],
+            "transcript_reply_deferred": True,
+        }
+
+
+class RecordingActionDetector:
+    def __init__(self, result: dict[str, object] | None = None) -> None:
+        self.rows: list[dict[str, object]] = []
+        self.result = result or {
+            "status": "complete",
+            "provider_labels": ["reporting_expenses"],
+            "action_codes": ["LOG_EXPENSES"],
+            "created_action_count": 1,
+            "none": False,
+        }
+
+    async def detect_actions(self, row: dict[str, object]) -> dict[str, object]:
+        self.rows.append(dict(row))
+        return dict(self.result)
+
+
+class RetryableActionDetector:
+    async def detect_actions(self, row: dict[str, object]) -> dict[str, object]:
+        del row
+        raise daemon.RetryableJobError("classifier temporary failure")
+
+
 class TelegramQueueDaemonTests(unittest.IsolatedAsyncioTestCase):
     def test_parse_args_accepts_uppercase_debug_alias(self) -> None:
         args = daemon.parse_args(["--DEBUG"])
@@ -282,8 +403,9 @@ class TelegramQueueDaemonTests(unittest.IsolatedAsyncioTestCase):
         content_type: str = "text",
         payload_json: str | None = None,
         text: str | None = "hello world",
+        action_detection_status: str | None = None,
     ) -> dict[str, object]:
-        return {
+        row = {
             "id": 42,
             "attempts": attempts,
             "max_attempts": max_attempts,
@@ -298,6 +420,9 @@ class TelegramQueueDaemonTests(unittest.IsolatedAsyncioTestCase):
             "chat_type": "supergroup",
             "message_id": 41,
         }
+        if action_detection_status is not None:
+            row["action_detection_status"] = action_detection_status
+        return row
 
     def make_bot(self) -> SimpleNamespace:
         return SimpleNamespace(set_message_reaction=AsyncMock())
@@ -355,6 +480,7 @@ class TelegramQueueDaemonTests(unittest.IsolatedAsyncioTestCase):
                         "processor": "text",
                         "text_length": 11,
                         "has_text": True,
+                        "action_detection": {"status": "not_applicable"},
                     },
                     "stage": "DONE",
                 }
@@ -373,6 +499,140 @@ class TelegramQueueDaemonTests(unittest.IsolatedAsyncioTestCase):
         )
         reaction = bot.set_message_reaction.await_args.kwargs["reaction"]
         self.assertEqual(reaction, "👌")
+
+    @patch("telegram_queue_daemon.asyncio.to_thread", new=immediate_to_thread)
+    async def test_process_one_row_detects_actions_before_marking_done(self) -> None:
+        store = FakeQueueStore()
+        action_detector = RecordingActionDetector()
+        bot = self.make_bot()
+        row = self.make_row(action_detection_status="pending")
+        store.rows[42] = dict(row)
+        worker = daemon.QueueDaemon(
+            config=self.make_config(),
+            queue_store=store,
+            action_detector=action_detector,
+        )
+
+        await worker.process_one_row(bot, row)
+
+        self.assertEqual(len(action_detector.rows), 1)
+        self.assertEqual(action_detector.rows[0]["action_detection_status"], "pending")
+        self.assertEqual(
+            store.done_calls[0]["result_json"]["action_detection"],
+            {
+                "status": "complete",
+                "provider_labels": ["reporting_expenses"],
+                "action_codes": ["LOG_EXPENSES"],
+                "created_action_count": 1,
+                "none": False,
+            },
+        )
+
+    @patch("telegram_queue_daemon.asyncio.to_thread", new=immediate_to_thread)
+    async def test_process_one_row_reloads_latest_row_before_action_detection(self) -> None:
+        store = FakeQueueStore()
+        action_detector = RecordingActionDetector()
+        bot = self.make_bot()
+        row = self.make_row(
+            content_type="voice",
+            text=None,
+            action_detection_status="pending",
+        )
+        store.rows[42] = dict(row)
+        worker = daemon.QueueDaemon(
+            config=self.make_config(),
+            queue_store=store,
+            processor=SaveProcessingTextProcessor(),
+            action_detector=action_detector,
+        )
+
+        await worker.process_one_row(bot, row)
+
+        self.assertEqual(
+            action_detector.rows[0]["processing_text"],
+            "fresh canonical text",
+        )
+        self.assertEqual(store.done_calls[0]["result_json"]["processor"], "save-text")
+
+    @patch("telegram_queue_daemon.asyncio.to_thread", new=immediate_to_thread)
+    async def test_process_one_row_sends_deferred_transcript_with_action_labels(self) -> None:
+        store = FakeQueueStore()
+        action_detector = RecordingActionDetector(
+            {
+                "status": "complete",
+                "provider_labels": ["reporting_expenses"],
+                "action_codes": ["LOG_EXPENSES"],
+                "created_action_count": 1,
+                "none": False,
+            }
+        )
+        bot = SimpleNamespace(
+            send_message=AsyncMock(
+                return_value=telegram_sent_message(9001, reply_to_message_id=41)
+            ),
+            set_message_reaction=AsyncMock(),
+        )
+        row = self.make_row(
+            content_type="voice",
+            text=None,
+            action_detection_status="pending",
+        )
+        store.rows[42] = dict(row)
+        worker = daemon.QueueDaemon(
+            config=self.make_config(),
+            queue_store=store,
+            processor=DeferredTranscriptProcessor(),
+            action_detector=action_detector,
+        )
+
+        await worker.process_one_row(bot, row)
+
+        bot.send_message.assert_awaited_once_with(
+            chat_id=-1003986727769,
+            text="voice transcript\n[reporting_expenses]",
+            reply_to_message_id=41,
+            allow_sending_without_reply=False,
+        )
+        self.assertEqual(
+            store.done_calls[0]["result_json"]["transcript_message_ids"],
+            [9001],
+        )
+        self.assertIn(
+            {
+                "job_id": 42,
+                "stage": STAGE_SENDING_RESPONSE,
+                "stage_detail": None,
+            },
+            store.stage_calls,
+        )
+
+    @patch("telegram_queue_daemon.asyncio.to_thread", new=immediate_to_thread)
+    async def test_process_one_row_retries_when_action_detection_is_retryable(self) -> None:
+        store = FakeQueueStore()
+        bot = self.make_bot()
+        row = self.make_row(action_detection_status="pending")
+        store.rows[42] = dict(row)
+        worker = daemon.QueueDaemon(
+            config=self.make_config(),
+            queue_store=store,
+            action_detector=RetryableActionDetector(),
+        )
+
+        await worker.process_one_row(bot, row)
+
+        self.assertEqual(store.done_calls, [])
+        self.assertEqual(
+            store.retry_calls,
+            [
+                {
+                    "job_id": 42,
+                    "delay_seconds": 1,
+                    "last_error": "classifier temporary failure",
+                }
+            ],
+        )
+        reaction = bot.set_message_reaction.await_args.kwargs["reaction"]
+        self.assertEqual(reaction, "🤔")
 
     @patch("telegram_queue_daemon.asyncio.to_thread", new=immediate_to_thread)
     async def test_process_one_row_does_not_set_success_reaction_when_mark_done_fails(self) -> None:
