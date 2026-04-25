@@ -4,18 +4,20 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from bot_libs.queue_processor_errors import RetryableJobError
 from bot_libs.action_detection_openai import (
     DEFAULT_OPENAI_ACTION_PROMPT_ID,
     DEFAULT_OPENAI_ACTION_PROMPT_VERSION,
     _detect_actions_sync,
     _extract_actions_text,
     _summarize_response,
+    detect_actions_with_openai,
     resolve_openai_action_prompt_id,
     resolve_openai_action_prompt_version,
 )
 
 
-class OpenAIActionDetectionTests(unittest.TestCase):
+class OpenAIActionDetectionTests(unittest.IsolatedAsyncioTestCase):
     @patch.dict("os.environ", {}, clear=True)
     def test_prompt_defaults(self) -> None:
         self.assertEqual(resolve_openai_action_prompt_id(), DEFAULT_OPENAI_ACTION_PROMPT_ID)
@@ -63,6 +65,13 @@ class OpenAIActionDetectionTests(unittest.TestCase):
                 },
             }
         )
+
+    @patch("bot_libs.action_detection_openai.asyncio.to_thread")
+    async def test_openai_provider_exception_is_retryable(self, to_thread: object) -> None:
+        to_thread.side_effect = RuntimeError("network down")
+
+        with self.assertRaisesRegex(RetryableJobError, "network down"):
+            await detect_actions_with_openai(incoming_text="I spent 30 on petrol")
 
     def test_extract_actions_text_accepts_output_text(self) -> None:
         self.assertEqual(_extract_actions_text('["none"]'), '["none"]')
