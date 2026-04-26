@@ -64,11 +64,22 @@ def _temporary_action_result(
     processor: str,
 ) -> dict[str, object]:
     action_code = str(row.get("action_code") or "")
-    return {
+    result = {
         "outcome": "processed",
         "processor": processor,
         "action_code": action_code,
     }
+    if action_code in {ACTION_LOG_EXPENSES, ACTION_LOG_INCOME}:
+        source_label = "income" if action_code == ACTION_LOG_INCOME else "expense"
+        result.update(
+            {
+                "ledger_state": "pending_calculation",
+                "ledger_status_text": (
+                    f"Logged as {source_label} source. Pending next /calculate."
+                ),
+            }
+        )
+    return result
 
 
 TEMPORARY_ACTION_PROCESSORS = {

@@ -10,6 +10,7 @@ from bot_libs.action_models import (
     ACTION_CALCULATE_INCOME_EXPENSES,
     ACTION_LOG_EXPENSES,
     ACTION_LOG_INCOME,
+    ACTION_STATUS_QUEUED,
     ACTION_SHOW_ALL_DETAILED,
     ACTION_SHOW_EXPENSES,
 )
@@ -54,6 +55,33 @@ class FakeIncomeExpenseProvider:
             ),
             raw_response={"entries": []},
         )
+
+
+class LaterIncomeSourceProvider(FakeIncomeExpenseProvider):
+    def __init__(self, store: SQLiteQueueStore) -> None:
+        super().__init__()
+        self.store = store
+        self.created_action_id: int | None = None
+
+    async def __call__(self, *, messy_csv_data: str) -> IncomeExpenseCalculationResult:
+        result = await super().__call__(messy_csv_data=messy_csv_data)
+        later_source = self.store.insert_queue_job(
+            make_job(
+                update_id=3,
+                message_id=458,
+                processing_text="Earned 50 from a later job.",
+            )
+        )
+        assert later_source.queue_id is not None
+        self.store.insert_incoming_message_actions(
+            queue_id=later_source.queue_id,
+            detection_run_id=None,
+            action_codes=(ACTION_LOG_INCOME,),
+        )
+        self.store.mark_job_done(later_source.queue_id, result_json={"ok": True})
+        later_actions = self.store.get_actions_for_queue_job(later_source.queue_id)
+        self.created_action_id = int(later_actions[0]["id"])
+        return result
 
 
 class CrossMonthIncomeExpenseProvider:
@@ -126,12 +154,49 @@ class IncomeExpenseProcessorTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIn("incoming_outgoing", provider.calls[0])
             self.assertEqual(result["inserted_count"], 2)
+            self.assertEqual(result["unprocessed_source_count"], 0)
             self.assertEqual(
                 store.get_unprocessed_income_expense_source_actions(),
                 (),
             )
             bot.send_message.assert_awaited_once()
             self.assertIn("Calculation complete", bot.send_message.await_args.kwargs["text"])
+
+    async def test_calculate_keeps_later_logged_source_pending_for_next_run(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            store, calculation_row = _store_with_mixed_source_and_action(tmpdir)
+            provider = LaterIncomeSourceProvider(store)
+            bot = SimpleNamespace(
+                send_message=AsyncMock(return_value=SimpleNamespace(message_id=9001))
+            )
+
+            result = await process_calculate_income_expenses(
+                bot,
+                calculation_row,
+                context=_context(store),
+                provider=provider,
+            )
+
+            self.assertEqual(result["inserted_count"], 2)
+            self.assertEqual(result["selected_unprocessed_source_count"], 2)
+            self.assertEqual(result["unprocessed_source_count"], 1)
+            self.assertEqual(len(result["source_action_ids"]), 2)
+            pending_sources = store.get_pending_income_expense_source_actions()
+            self.assertEqual(len(pending_sources), 1)
+            self.assertEqual(pending_sources[0]["action_id"], provider.created_action_id)
+            self.assertEqual(pending_sources[0]["action_status"], ACTION_STATUS_QUEUED)
+            self.assertNotIn(
+                provider.created_action_id,
+                result["source_action_ids"],
+            )
+            sent_text = bot.send_message.await_args.kwargs["text"]
+            self.assertIn("Calculation complete for 2 source rows.", sent_text)
+            self.assertIn(
+                "Note: 1 income/expense source item is still pending and was not "
+                "included in this calculation snapshot.",
+                sent_text,
+            )
+            self.assertIn("Run /calculate again to include it.", sent_text)
 
     async def test_calculate_reprocesses_recent_sources_for_corrections(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -233,7 +298,11 @@ class IncomeExpenseProcessorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["inserted_count"], 0)
             self.assertFalse(result["force_recalculation"])
             sent_text = bot.send_message.await_args.kwargs["text"]
-            self.assertIn("No unprocessed income or expense voice entries found.", sent_text)
+            self.assertIn(
+                "No unprocessed income or expense source entries found "
+                "in the last 7 days.",
+                sent_text,
+            )
             self.assertIn("/calculate_force", sent_text)
 
     async def test_calculate_force_reprocesses_without_unprocessed_sources(self) -> None:
@@ -354,10 +423,9 @@ class IncomeExpenseProcessorTests(unittest.IsolatedAsyncioTestCase):
             sent_text = bot.send_message.await_args.kwargs["text"]
             self.assertTrue(
                 sent_text.startswith(
-                    "<b>The calculation below is out-of-date; there are "
-                    "unprocessed voice entries.</b>\n"
-                    "<i>Use /calculate if you wish. We auto-calculate on "
-                    "Sunday 23:59:59 each week.</i>\n\n"
+                    "<b>The ledger below is out of date; 1 income/expense "
+                    "source item is pending calculation.</b>\n"
+                    "<i>Run /calculate to include it.</i>\n\n"
                 )
             )
             self.assertIn("<b>APRIL 2026:</b>", sent_text)

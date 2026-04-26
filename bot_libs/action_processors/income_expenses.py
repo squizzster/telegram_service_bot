@@ -56,15 +56,24 @@ async def process_calculate_income_expenses(
     queue_store = _queue_store(context)
     action_job_id = _row_int(row, "id")
     force_recalculation = _is_force_calculation_command(row)
+    calculation_reference_utc = _calculation_reference_datetime(row)
+    recalculation_window_start_utc = calculation_reference_utc - timedelta(
+        days=RECALCULATION_LOOKBACK_DAYS
+    )
 
     existing_rows = await asyncio.to_thread(
         queue_store.get_income_expense_rows_for_calculation_action,
         action_job_id,
     )
     if existing_rows:
+        pending_source_rows = await asyncio.to_thread(
+            queue_store.get_pending_income_expense_source_actions,
+            window_start_utc=recalculation_window_start_utc,
+        )
         message_text = _format_calculation_summary(
-            source_count=0,
+            source_count=_source_action_count_for_ledger_rows(existing_rows),
             inserted_rows=existing_rows,
+            pending_source_count=len(pending_source_rows),
             reused=True,
         )
         message_ids = await _send_action_message(
@@ -78,16 +87,13 @@ async def process_calculate_income_expenses(
             "outcome": "processed",
             "processor": "income_expense_calculation",
             "action_code": ACTION_CALCULATE_INCOME_EXPENSES,
-            "source_action_count": 0,
+            "source_action_count": _source_action_count_for_ledger_rows(existing_rows),
             "inserted_count": len(existing_rows),
+            "unprocessed_source_count": len(pending_source_rows),
             "reused_existing_result": True,
             "message_ids": message_ids,
         }
 
-    calculation_reference_utc = _calculation_reference_datetime(row)
-    recalculation_window_start_utc = calculation_reference_utc - timedelta(
-        days=RECALCULATION_LOOKBACK_DAYS
-    )
     unprocessed_source_rows = await asyncio.to_thread(
         queue_store.get_recent_income_expense_source_actions,
         window_start_utc=recalculation_window_start_utc,
@@ -100,7 +106,8 @@ async def process_calculate_income_expenses(
             context=context,
             outbound_kind="income_expense_calculation",
             message_text=(
-                "No unprocessed income or expense voice entries found.\n"
+                "No unprocessed income or expense source entries found "
+                "in the last 7 days.\n"
                 "Use /calculate_force to recalculate the last 7 days anyway."
             ),
         )
@@ -124,7 +131,9 @@ async def process_calculate_income_expenses(
             row,
             context=context,
             outbound_kind="income_expense_calculation",
-            message_text="No income or expense entries found in the last 7 days.",
+            message_text=(
+                "No income or expense source entries found in the last 7 days."
+            ),
         )
         return {
             "outcome": "processed",
@@ -136,20 +145,26 @@ async def process_calculate_income_expenses(
         }
 
     messy_csv_data = _build_messy_income_expense_csv(source_rows)
+    selected_source_action_ids = tuple(int(item["action_id"]) for item in source_rows)
     await _set_stage(context, STAGE_CALCULATING_INCOME_EXPENSES)
     provider_result = await provider(messy_csv_data=messy_csv_data)
     _validate_calculated_entries(provider_result.entries, source_rows)
     inserted_rows = await asyncio.to_thread(
         queue_store.record_income_expense_calculation,
         calculation_action_id=action_job_id,
-        source_action_ids=tuple(int(item["action_id"]) for item in source_rows),
+        source_action_ids=selected_source_action_ids,
         entries=provider_result.entries,
         recalculation_window_start_utc=recalculation_window_start_utc,
+    )
+    pending_source_rows = await asyncio.to_thread(
+        queue_store.get_pending_income_expense_source_actions,
+        window_start_utc=recalculation_window_start_utc,
     )
 
     message_text = _format_calculation_summary(
         source_count=len(source_rows),
         inserted_rows=inserted_rows,
+        pending_source_count=len(pending_source_rows),
         reused=False,
     )
     message_ids = await _send_action_message(
@@ -166,8 +181,10 @@ async def process_calculate_income_expenses(
         "provider": provider_result.provider,
         "prompt_id": provider_result.prompt_id,
         "source_action_count": len(source_rows),
+        "source_action_ids": list(selected_source_action_ids),
         "inserted_count": len(inserted_rows),
-        "unprocessed_source_count": len(unprocessed_source_rows),
+        "selected_unprocessed_source_count": len(unprocessed_source_rows),
+        "unprocessed_source_count": len(pending_source_rows),
         "force_recalculation": force_recalculation,
         "recalculation_lookback_days": RECALCULATION_LOOKBACK_DAYS,
         "recalculation_window_start_utc": _display_timestamp(
@@ -193,14 +210,14 @@ async def process_show_income_expense_report(
         queue_store.get_income_expense_rows_for_week,
         direction=direction,
     )
-    unprocessed_sources = await asyncio.to_thread(
-        queue_store.get_unprocessed_income_expense_source_actions
+    pending_sources = await asyncio.to_thread(
+        queue_store.get_pending_income_expense_source_actions
     )
     if report_style == "detailed":
         message_text = _format_detailed_report_rows(rows, direction=direction)
         message_text = _prepend_out_of_date_warning(
             message_text,
-            has_unprocessed_sources=bool(unprocessed_sources),
+            unprocessed_source_count=len(pending_sources),
             html_format=False,
         )
         parse_mode = None
@@ -208,7 +225,7 @@ async def process_show_income_expense_report(
         message_text = _format_friendly_report_rows(rows, direction=direction)
         message_text = _prepend_out_of_date_warning(
             message_text,
-            has_unprocessed_sources=bool(unprocessed_sources),
+            unprocessed_source_count=len(pending_sources),
             html_format=True,
         )
         parse_mode = "HTML"
@@ -227,7 +244,7 @@ async def process_show_income_expense_report(
         "direction": direction or "all",
         "report_style": report_style,
         "row_count": len(rows),
-        "unprocessed_source_count": len(unprocessed_sources),
+        "unprocessed_source_count": len(pending_sources),
         "message_ids": message_ids,
     }
 
@@ -415,18 +432,38 @@ def _format_calculation_summary(
     *,
     source_count: int,
     inserted_rows: tuple[Mapping[str, object], ...],
+    pending_source_count: int,
     reused: bool,
 ) -> str:
-    prefix = "Calculation already recorded." if reused else "Calculation complete."
+    if reused:
+        prefix = "Calculation already recorded."
+    else:
+        prefix = (
+            "Calculation complete for "
+            f"{source_count} {_source_row_label(source_count)}."
+        )
     incoming_total = _total_for_direction(inserted_rows, "incoming")
     outgoing_total = _total_for_direction(inserted_rows, "outgoing")
-    return (
+    summary = (
         f"{prefix}\n"
-        f"Source action rows: {source_count}\n"
+        f"Selected source rows: {source_count}\n"
         f"Ledger rows: {len(inserted_rows)}\n"
         f"Incoming: {incoming_total:.2f}\n"
         f"Outgoing: {outgoing_total:.2f}\n"
         f"Net: {(incoming_total - outgoing_total):.2f}"
+    )
+    if pending_source_count <= 0:
+        return summary
+    item_label = _source_item_label(pending_source_count)
+    verb = "is" if pending_source_count == 1 else "are"
+    included_verb = "was" if pending_source_count == 1 else "were"
+    pronoun = "it" if pending_source_count == 1 else "them"
+    return (
+        f"{summary}\n\n"
+        f"Note: {pending_source_count} income/expense source {item_label} "
+        f"{verb} still pending and {included_verb} not included in this "
+        "calculation snapshot.\n"
+        f"Run /calculate again to include {pronoun}."
     )
 
 
@@ -476,26 +513,49 @@ def _format_detailed_report_rows(
 def _prepend_out_of_date_warning(
     message_text: str,
     *,
-    has_unprocessed_sources: bool,
+    unprocessed_source_count: int,
     html_format: bool,
 ) -> str:
-    if not has_unprocessed_sources:
+    if unprocessed_source_count <= 0:
         return message_text
+    item_label = _source_item_label(unprocessed_source_count)
+    verb = "is" if unprocessed_source_count == 1 else "are"
+    pronoun = "it" if unprocessed_source_count == 1 else "them"
     if html_format:
         warning = (
-            "<b>The calculation below is out-of-date; there are unprocessed "
-            "voice entries.</b>\n"
-            "<i>Use /calculate if you wish. We auto-calculate on Sunday "
-            "23:59:59 each week.</i>"
+            "<b>The ledger below is out of date; "
+            f"{unprocessed_source_count} income/expense source {item_label} "
+            f"{verb} pending calculation.</b>\n"
+            f"<i>Run /calculate to include {pronoun}.</i>"
         )
     else:
         warning = (
-            "The calculation below is out-of-date; there are unprocessed "
-            "voice entries.\n"
-            "Use /calculate if you wish. We auto-calculate on Sunday "
-            "23:59:59 each week."
+            "The ledger below is out of date; "
+            f"{unprocessed_source_count} income/expense source {item_label} "
+            f"{verb} pending calculation.\n"
+            f"Run /calculate to include {pronoun}."
         )
     return f"{warning}\n\n{message_text}"
+
+
+def _source_action_count_for_ledger_rows(
+    rows: tuple[Mapping[str, object], ...],
+) -> int:
+    return len(
+        {
+            int(row["source_action_id"])
+            for row in rows
+            if row.get("source_action_id") is not None
+        }
+    )
+
+
+def _source_row_label(count: int) -> str:
+    return "source row" if count == 1 else "source rows"
+
+
+def _source_item_label(count: int) -> str:
+    return "item" if count == 1 else "items"
 
 
 def _format_friendly_report_rows(

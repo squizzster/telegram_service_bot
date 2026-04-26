@@ -31,6 +31,9 @@ class ActionDispatchTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["outcome"], "processed")
                 self.assertEqual(result["action_code"], action_code)
                 self.assertNotIn("temporary_roll", result)
+                if action_code in {ACTION_LOG_EXPENSES, ACTION_LOG_INCOME}:
+                    self.assertEqual(result["ledger_state"], "pending_calculation")
+                    self.assertIn("Pending next /calculate", result["ledger_status_text"])
 
     async def test_none_action_is_noop_success_if_it_ever_exists(self) -> None:
         processor = DispatchingActionProcessor()

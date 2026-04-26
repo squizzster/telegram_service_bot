@@ -1394,30 +1394,51 @@ class SQLiteQueueStore:
             only_unprocessed=True,
         )
 
+    def get_pending_income_expense_source_actions(
+        self,
+        *,
+        window_start_utc: datetime | str | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        return self.get_recent_income_expense_source_actions(
+            window_start_utc=window_start_utc,
+            only_unprocessed=True,
+            action_statuses=(
+                ACTION_STATUS_QUEUED,
+                ACTION_STATUS_PROCESSING,
+                ACTION_STATUS_DONE,
+            ),
+        )
+
     def get_recent_income_expense_source_actions(
         self,
         *,
         window_start_utc: datetime | str | None,
         only_unprocessed: bool = False,
+        action_statuses: tuple[str, ...] | None = None,
     ) -> tuple[dict[str, Any], ...]:
         normalized_window_start = _normalize_recalculation_window_start(
             window_start_utc
         )
+        normalized_action_statuses = action_statuses or (ACTION_STATUS_DONE,)
+        if not normalized_action_statuses:
+            raise QueueStoreError("at least one income/expense action status is required")
+        action_status_placeholders = ",".join("?" for _ in normalized_action_statuses)
         try:
             with self._connect() as conn:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT
                         ima.id AS action_id,
                         ima.queue_id AS entry_id,
                         ima.action_code,
+                        ima.status AS action_status,
                         tq.telegram_date AS date_time_utc,
                         tq.processing_text AS description
                     FROM incoming_message_actions AS ima
                     JOIN telegram_queue AS tq
                       ON tq.id = ima.queue_id
                     WHERE ima.action_code IN (?, ?)
-                      AND ima.status = ?
+                      AND ima.status IN ({action_status_placeholders})
                       AND tq.status = ?
                       AND (? = 0 OR ima.income_expense_processed_at IS NULL)
                       AND (? IS NULL OR datetime(tq.telegram_date) >= datetime(?))
@@ -1427,7 +1448,7 @@ class SQLiteQueueStore:
                     (
                         ACTION_LOG_EXPENSES,
                         ACTION_LOG_INCOME,
-                        ACTION_STATUS_DONE,
+                        *normalized_action_statuses,
                         STATUS_DONE,
                         1 if only_unprocessed else 0,
                         normalized_window_start,
@@ -1749,13 +1770,33 @@ class SQLiteQueueStore:
 
         return dict(row) if row is not None else None
 
-    def claim_next_action(self, *, worker_name: str) -> dict[str, Any] | None:
+    def claim_next_action(
+        self,
+        *,
+        worker_name: str,
+        action_codes: tuple[str, ...] | None = None,
+    ) -> dict[str, Any] | None:
+        if action_codes is not None and not action_codes:
+            raise ValueError("action_codes must not be empty when provided")
+
+        action_code_filter = ""
+        query_params: list[object] = [
+            ACTION_STATUS_QUEUED,
+            STATUS_DONE,
+        ]
+        if action_codes is not None:
+            action_code_placeholders = ",".join("?" for _ in action_codes)
+            action_code_filter = (
+                f" AND ima.action_code IN ({action_code_placeholders})"
+            )
+            query_params.extend(action_codes)
+
         conn: sqlite3.Connection | None = None
         try:
             with self._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
-                    """
+                    f"""
                     SELECT ima.id
                     FROM incoming_message_actions AS ima
                     JOIN telegram_queue AS tq
@@ -1763,10 +1804,11 @@ class SQLiteQueueStore:
                     WHERE ima.status = ?
                       AND ima.available_at <= CURRENT_TIMESTAMP
                       AND tq.status = ?
+                      {action_code_filter}
                     ORDER BY ima.available_at, ima.queue_id, ima.detected_order, ima.id
                     LIMIT 1
                     """,
-                    (ACTION_STATUS_QUEUED, STATUS_DONE),
+                    tuple(query_params),
                 ).fetchone()
                 if row is None:
                     conn.commit()

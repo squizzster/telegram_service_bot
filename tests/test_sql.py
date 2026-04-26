@@ -24,6 +24,7 @@ from bot_libs.action_models import (
     ACTION_DETECTION_PROCESSING,
     ACTION_LOG_EXPENSES,
     ACTION_LOG_INCOME,
+    ACTION_SHOW_ALL,
     ACTION_SHOW_ALL_DETAILED,
     ACTION_SHOW_EXPENSES,
     ACTION_PROVIDER_ASKING_A_QUESTION,
@@ -763,6 +764,59 @@ class SQLiteQueueStoreTests(unittest.TestCase):
             self.assertEqual(claim["chat_id"], 123)
             self.assertEqual(claim["message_id"], 456)
             self.assertEqual(claim["processing_text"], "I spent 30 on petrol")
+
+    def test_claim_next_action_can_filter_report_actions(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.sqlite"
+            store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
+            store.create_schema(create_parent_dir=True)
+            calculation = store.insert_queue_job(
+                make_job(
+                    update_id=1,
+                    message_id=456,
+                    processing_text="/calculate",
+                )
+            )
+            report = store.insert_queue_job(
+                make_job(
+                    update_id=2,
+                    message_id=457,
+                    processing_text="/show_all",
+                )
+            )
+            assert calculation.queue_id is not None
+            assert report.queue_id is not None
+            store.insert_incoming_message_actions(
+                queue_id=calculation.queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_CALCULATE_INCOME_EXPENSES,),
+            )
+            store.insert_incoming_message_actions(
+                queue_id=report.queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_SHOW_ALL,),
+            )
+            store.mark_job_done(calculation.queue_id, result_json={"ok": True})
+            store.mark_job_done(report.queue_id, result_json={"ok": True})
+
+            report_claim = store.claim_next_action(
+                worker_name="action-worker",
+                action_codes=(ACTION_SHOW_ALL,),
+            )
+            calculation_claim = store.claim_next_action(worker_name="action-worker")
+
+            assert report_claim is not None
+            assert calculation_claim is not None
+            self.assertEqual(report_claim["queue_id"], report.queue_id)
+            self.assertEqual(report_claim["action_code"], ACTION_SHOW_ALL)
+            self.assertEqual(
+                calculation_claim["queue_id"],
+                calculation.queue_id,
+            )
+            self.assertEqual(
+                calculation_claim["action_code"],
+                ACTION_CALCULATE_INCOME_EXPENSES,
+            )
 
     def test_mark_action_for_retry_persists_backoff_state(self) -> None:
         with TemporaryDirectory() as tmpdir:

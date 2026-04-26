@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import signal
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from bot_libs.action_models import (
+    ACTION_CALCULATE_INCOME_EXPENSES,
+    ACTION_SHOW_ALL,
+    ACTION_STATUS_PROCESSING,
+    ACTION_STATUS_QUEUED,
+)
 from bot_libs.sql import SQLiteSettings
 from bot_libs.stage_names import (
     STAGE_ANSWERING_QUESTION,
@@ -28,6 +35,26 @@ class FakeActionStore:
         self.outbound_calls: list[dict[str, object]] = []
         self.recovered = 0
         self.next_action_available_at = None
+        self.action_rows: list[dict[str, object]] = []
+
+    def claim_next_action(
+        self,
+        *,
+        worker_name: str,
+        action_codes: tuple[str, ...] | None = None,
+    ) -> dict[str, object] | None:
+        for row in self.action_rows:
+            if row.get("status") != ACTION_STATUS_QUEUED:
+                continue
+            if action_codes is not None and row.get("action_code") not in action_codes:
+                continue
+
+            row["status"] = ACTION_STATUS_PROCESSING
+            row["stage"] = STAGE_PROCESSING_ACTION
+            row["locked_by"] = worker_name
+            row["attempts"] = int(row.get("attempts") or 0) + 1
+            return dict(row)
+        return None
 
     def mark_action_done(
         self,
@@ -117,6 +144,31 @@ class SuccessProcessor(daemon.ActionProcessor):
     ) -> dict[str, object]:
         del bot, row, context
         return {"processor": "success"}
+
+
+class BlockingCalculateProcessor(daemon.ActionProcessor):
+    def __init__(self) -> None:
+        self.blocking_started = asyncio.Event()
+        self.release_blocking = asyncio.Event()
+        self.report_processed = asyncio.Event()
+        self.processed_action_codes: list[str] = []
+
+    async def process(
+        self,
+        bot: object,
+        row: dict[str, object],
+        *,
+        context: object = None,
+    ) -> dict[str, object]:
+        del bot, context
+        action_code = str(row.get("action_code") or "")
+        self.processed_action_codes.append(action_code)
+        if action_code == ACTION_CALCULATE_INCOME_EXPENSES:
+            self.blocking_started.set()
+            await self.release_blocking.wait()
+        if action_code == ACTION_SHOW_ALL:
+            self.report_processed.set()
+        return {"processor": "blocking-calculate"}
 
 
 class ContextProcessor(daemon.ActionProcessor):
@@ -225,13 +277,16 @@ class TelegramActionDaemonTests(unittest.IsolatedAsyncioTestCase):
     def make_row(
         self,
         *,
+        id: int = 7,
+        queue_id: int = 42,
         attempts: int = 1,
         max_attempts: int = daemon.DEFAULT_MAX_ATTEMPTS,
         action_code: str = "LOG_EXPENSES",
+        status: str | None = None,
     ) -> dict[str, object]:
-        return {
-            "id": 7,
-            "queue_id": 42,
+        row = {
+            "id": id,
+            "queue_id": queue_id,
             "action_code": action_code,
             "attempts": attempts,
             "max_attempts": max_attempts,
@@ -239,6 +294,9 @@ class TelegramActionDaemonTests(unittest.IsolatedAsyncioTestCase):
             "chat_type": "supergroup",
             "message_id": 41,
         }
+        if status is not None:
+            row["status"] = status
+        return row
 
     def make_bot(self) -> SimpleNamespace:
         reactions: list[str] = []
@@ -278,6 +336,53 @@ class TelegramActionDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(worker._restart_requested)
         self.assertTrue(worker._stop_requested)
         self.assertTrue(worker._wake_event.is_set())
+
+    async def test_show_all_runs_while_calculate_action_is_blocked(self) -> None:
+        store = FakeActionStore()
+        store.action_rows.append(
+            self.make_row(
+                id=1,
+                queue_id=10,
+                action_code=ACTION_CALCULATE_INCOME_EXPENSES,
+                attempts=0,
+                status=ACTION_STATUS_QUEUED,
+            )
+        )
+        bot = self.make_bot()
+        processor = BlockingCalculateProcessor()
+        worker = daemon.ActionDaemon(
+            config=self.make_config(),
+            queue_store=store,
+            processor=processor,
+        )
+
+        drain_task = asyncio.create_task(worker.drain_due_actions(bot))
+        await asyncio.wait_for(processor.blocking_started.wait(), timeout=1)
+
+        store.action_rows.append(
+            self.make_row(
+                id=2,
+                queue_id=11,
+                action_code=ACTION_SHOW_ALL,
+                attempts=0,
+                status=ACTION_STATUS_QUEUED,
+            )
+        )
+        worker._handle_signal(signal.SIGHUP)
+
+        await asyncio.wait_for(processor.report_processed.wait(), timeout=1)
+        processor.release_blocking.set()
+        processed = await asyncio.wait_for(drain_task, timeout=1)
+
+        self.assertEqual(processed, 2)
+        self.assertEqual(
+            processor.processed_action_codes,
+            [ACTION_CALCULATE_INCOME_EXPENSES, ACTION_SHOW_ALL],
+        )
+        self.assertEqual(
+            [call["action_job_id"] for call in store.done_calls],
+            [2, 1],
+        )
 
     @patch("telegram_action_daemon.asyncio.to_thread", new=immediate_to_thread)
     async def test_process_one_action_marks_success_done_and_sets_reactions(self) -> None:

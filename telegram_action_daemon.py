@@ -19,6 +19,12 @@ if __package__ in {None, ""}:
 from telegram import Bot  # noqa: E402
 
 from bot_libs.action_dispatch import DispatchingActionProcessor  # noqa: E402
+from bot_libs.action_models import (  # noqa: E402
+    ACTION_SHOW_ALL,
+    ACTION_SHOW_ALL_DETAILED,
+    ACTION_SHOW_EXPENSES,
+    ACTION_SHOW_INCOME,
+)
 from bot_libs.action_processing_context import ActionProcessingContext  # noqa: E402
 from bot_libs.daemon_signal import (  # noqa: E402
     ACTION_DAEMON_PROCESS_NAME,
@@ -67,6 +73,12 @@ log = logging.getLogger(__name__)
 
 DEFAULT_MAX_ATTEMPTS = DEFAULT_QUEUE_MAX_ATTEMPTS
 DEFAULT_POLL_SECONDS = 120
+REPORT_ACTION_CODES = (
+    ACTION_SHOW_EXPENSES,
+    ACTION_SHOW_INCOME,
+    ACTION_SHOW_ALL,
+    ACTION_SHOW_ALL_DETAILED,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,7 +230,70 @@ class ActionDaemon:
                 row.get("attempts"),
                 row.get("max_attempts"),
             )
-            await self.process_one_action(bot, row)
+            if _is_report_action(row):
+                await self.process_one_action(bot, row)
+                continue
+
+            action_task = asyncio.create_task(self.process_one_action(bot, row))
+            processed += await self._drain_report_actions_while_blocked(
+                bot,
+                blocking_task=action_task,
+            )
+            await action_task
+
+        return processed
+
+    async def _drain_report_actions_while_blocked(
+        self,
+        bot: Bot,
+        *,
+        blocking_task: asyncio.Task[None],
+    ) -> int:
+        processed = 0
+
+        while not self._stop_requested and not blocking_task.done():
+            try:
+                row = await asyncio.to_thread(
+                    self.queue_store.claim_next_action,
+                    worker_name=self.config.worker_name,
+                    action_codes=REPORT_ACTION_CODES,
+                )
+            except (QueueStoreError, SchemaVerificationError):
+                log.exception("Failed to claim report action job")
+                return processed
+
+            if row is not None:
+                processed += 1
+                log.debug(
+                    "report action_job=%s claimed while blocking action runs "
+                    "queue_id=%s action_code=%s attempts=%s max_attempts=%s",
+                    row.get("id"),
+                    row.get("queue_id"),
+                    row.get("action_code"),
+                    row.get("attempts"),
+                    row.get("max_attempts"),
+                )
+                await self.process_one_action(bot, row)
+                continue
+
+            wake_task = asyncio.create_task(self._wake_event.wait())
+            done, pending = await asyncio.wait(
+                {blocking_task, wake_task},
+                timeout=1,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            del pending
+            if not wake_task.done():
+                wake_task.cancel()
+                await asyncio.gather(wake_task, return_exceptions=True)
+            if wake_task in done and self._wake_event.is_set():
+                pending_wakeups = self._consume_pending_wakeups()
+                self._wake_event.clear()
+                if pending_wakeups > 0:
+                    log.debug(
+                        "Consuming wake request while blocking action runs count=%s",
+                        pending_wakeups,
+                    )
 
         return processed
 
@@ -767,6 +842,10 @@ def _row_text(
 def _error_text(exc: BaseException) -> str:
     text = str(exc).strip()
     return text or exc.__class__.__name__
+
+
+def _is_report_action(row: Mapping[str, object]) -> bool:
+    return str(row.get("action_code") or "") in REPORT_ACTION_CODES
 
 
 def _normalize_success_result(

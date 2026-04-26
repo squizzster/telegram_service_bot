@@ -195,6 +195,11 @@ telegram_action_daemon.py
   → persist action result/outbound state
 ```
 
+The action daemon keeps long-running action work durable in SQLite, but report
+commands are a fast lane: `/show_all`, `/show_expenses`, `/show_income`, and
+`/show_all_detailed` can run while a slower action such as `/calculate` is
+waiting on an LLM response.
+
 For local development restarts, use:
 
 ```bash
@@ -215,8 +220,10 @@ Current durable storage expectations:
 Income/expense behavior:
 
 - `LOG_EXPENSES` and `LOG_INCOME` actions are source markers.
-- `/calculate` only calls the LLM when there are unprocessed income/expense source rows in the rolling 7-day window.
+- A `LOG_EXPENSES` or `LOG_INCOME` action can be `done` while still pending ledger calculation. Its `income_expense_processed_at` field is the durable "included in ledger" boundary.
+- `/calculate` is snapshot-based. It only calls the LLM when there are unprocessed income/expense source rows in the rolling 7-day window, records the selected source action IDs, and marks only those selected source actions as processed.
 - `/calculate_force` rebuilds the rolling 7-day ledger even when nothing new is unprocessed.
+- Calculation replies warn when another income/expense source item is still pending after the selected snapshot is written.
 - `/show_all`, `/show_expenses`, `/show_income`, and `/show_all_detailed` read from the processed ledger table.
 - Report commands prepend an out-of-date warning if there are unprocessed income/expense source entries.
 - A Sunday `23:59:59` auto-calculate is intended behavior but is not the current scheduler implementation yet.
