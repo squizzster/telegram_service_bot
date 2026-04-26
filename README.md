@@ -157,6 +157,103 @@ The action daemon uses the same 1, 3, 9, ... retry schedule as the source queue.
 
 ---
 
+## Standalone Development Refresh
+
+This section is the fast context refresh for future local work.
+
+The repo lives at:
+
+```bash
+/home/auto_charles/telegram
+```
+
+The three long-running processes are normally run in separate local terminals:
+
+```bash
+./bot.py
+./telegram_queue_daemon.py --DEBUG
+./telegram_action_daemon.py --DEBUG
+```
+
+The bot is only the ingress edge. The queue daemon and action daemon are where most work happens:
+
+```text
+bot.py
+  → persist Telegram update to SQLite
+  → wake queue daemon with SIGHUP
+
+telegram_queue_daemon.py
+  → process source queue rows
+  → produce canonical processing_text
+  → run action detection when applicable
+  → create incoming_message_actions rows
+  → wake action daemon
+
+telegram_action_daemon.py
+  → process child action rows
+  → send action replies
+  → persist action result/outbound state
+```
+
+For local development restarts, use:
+
+```bash
+python -m bot_libs.dev_restart
+```
+
+That sends `SIGUSR1` to the bot, queue daemon, and action daemon using their pidfiles. Each process exits cleanly and re-execs the same Python command, keeping the same terminal log stream. `SIGHUP` is still reserved for daemon wakeups.
+
+Current durable storage expectations:
+
+- SQLite schema version is `6`.
+- `telegram_queue` is the durable source-message ledger.
+- `action_detection_runs` records action classifier runs.
+- `incoming_message_actions` records child action jobs and their retry/result state.
+- `incoming_outgoing_expenses` is the canonical processed income/expense ledger.
+- Rows are operational state, not an immutable event journal. Some rows are updated in place, and recent income/expense ledger rows can be replaced by recalculation.
+
+Income/expense behavior:
+
+- `LOG_EXPENSES` and `LOG_INCOME` actions are source markers.
+- `/calculate` only calls the LLM when there are unprocessed income/expense source rows in the rolling 7-day window.
+- `/calculate_force` rebuilds the rolling 7-day ledger even when nothing new is unprocessed.
+- `/show_all`, `/show_expenses`, `/show_income`, and `/show_all_detailed` read from the processed ledger table.
+- Report commands prepend an out-of-date warning if there are unprocessed income/expense source entries.
+- A Sunday `23:59:59` auto-calculate is intended behavior but is not the current scheduler implementation yet.
+
+Telegram reaction conventions:
+
+- `👀` means accepted/queued.
+- `⚡` means AI prompt/API work is running.
+- `👌` means successful terminal state.
+- `🤔`, `🥱`, and `😴` are retry-waiting states by delay length.
+- `💔` means failed/dead.
+- Reactions are visible UX only; SQLite state is the correctness boundary.
+
+OpenAI prompt contracts currently used:
+
+- Action detection uses prompt `pmpt_69ed0e37aab08193aef354f523d55a240171a57891089e80`.
+- Question answering uses prompt `pmpt_69ed2980b0988195b26594cc5467f26f07bc6d43e5ee5db1`.
+- Income/expense calculation uses prompt `pmpt_69ee3c457fc081938576d3e02a80b6bd0569ee240260b2f9`.
+- Prompt versions are intentionally omitted where the code expects the OpenAI prompt default version.
+
+Development workflow notes:
+
+- Run tests with `python -m pytest -q tests`.
+- Do not use bare `pytest` if backup trees or generated folders might be present.
+- In this active-development repo, direct schema recreation is acceptable when contracts change.
+- Commit finished local work, but do not push unless explicitly asked.
+- Leave unrelated untracked/generated files alone unless the task is specifically to clean them.
+
+Likely next cleanup candidates:
+
+- Rename or replace `action_processors/temporary.py` once reminder and source-marker semantics settle.
+- Decide whether `LOG_EXPENSES` and `LOG_INCOME` should remain executable no-op source actions or become a more explicit source-ingestion action type.
+- Add the Sunday auto-calculate scheduler when the manual `/calculate` and `/calculate_force` behavior is settled.
+- Consider an append-only event journal later if operational audit requirements outgrow the current mutable SQLite state tables.
+
+---
+
 # 1. Architectural identity
 
 This project implements a **durable Telegram message-processing pipeline** optimized for media workflows, especially short voice/audio transcription.
