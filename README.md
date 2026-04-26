@@ -138,7 +138,7 @@ answer text
 
 Missing, empty, or unclosed `answer` blocks are treated as retryable provider failures.
 
-During development, schema compatibility is not preserved. The current schema version is `5`. Recreate the local SQLite database when the schema changes:
+During development, schema compatibility is not preserved. The current schema version is `6`. Recreate the local SQLite database when the schema changes:
 
 ```bash
 ./bot_libs/sql_bot_init.py --drop-delete-current-db --force
