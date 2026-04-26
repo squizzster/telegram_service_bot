@@ -164,11 +164,24 @@ async def process_show_income_expense_report(
         queue_store.get_income_expense_rows_for_week,
         direction=direction,
     )
+    unprocessed_sources = await asyncio.to_thread(
+        queue_store.get_unprocessed_income_expense_source_actions
+    )
     if report_style == "detailed":
         message_text = _format_detailed_report_rows(rows, direction=direction)
+        message_text = _prepend_out_of_date_warning(
+            message_text,
+            has_unprocessed_sources=bool(unprocessed_sources),
+            html_format=False,
+        )
         parse_mode = None
     else:
         message_text = _format_friendly_report_rows(rows, direction=direction)
+        message_text = _prepend_out_of_date_warning(
+            message_text,
+            has_unprocessed_sources=bool(unprocessed_sources),
+            html_format=True,
+        )
         parse_mode = "HTML"
     message_ids = await _send_action_message(
         bot,
@@ -185,6 +198,7 @@ async def process_show_income_expense_report(
         "direction": direction or "all",
         "report_style": report_style,
         "row_count": len(rows),
+        "unprocessed_source_count": len(unprocessed_sources),
         "message_ids": message_ids,
     }
 
@@ -419,6 +433,31 @@ def _format_detailed_report_rows(
         lines.append(f"Total expenses: {outgoing_total:.2f}")
         lines.append(f"Net: {(incoming_total - outgoing_total):.2f}")
     return "\n".join(lines)
+
+
+def _prepend_out_of_date_warning(
+    message_text: str,
+    *,
+    has_unprocessed_sources: bool,
+    html_format: bool,
+) -> str:
+    if not has_unprocessed_sources:
+        return message_text
+    if html_format:
+        warning = (
+            "<b>The calculation below is out-of-date; there are unprocessed "
+            "voice entries.</b>\n"
+            "<i>Use /calculate if you wish. We auto-calculate on Sunday "
+            "23:59:59 each week.</i>"
+        )
+    else:
+        warning = (
+            "The calculation below is out-of-date; there are unprocessed "
+            "voice entries.\n"
+            "Use /calculate if you wish. We auto-calculate on Sunday "
+            "23:59:59 each week."
+        )
+    return f"{warning}\n\n{message_text}"
 
 
 def _format_friendly_report_rows(

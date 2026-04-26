@@ -235,6 +235,65 @@ class IncomeExpenseProcessorTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("Pet supplies.", sent_text)
             self.assertEqual(bot.send_message.await_args.kwargs["parse_mode"], "HTML")
 
+    async def test_show_all_warns_when_source_entries_are_unprocessed(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            store, calculation_row = _store_with_mixed_source_and_action(tmpdir)
+            await process_calculate_income_expenses(
+                SimpleNamespace(
+                    send_message=AsyncMock(return_value=SimpleNamespace(message_id=9001))
+                ),
+                calculation_row,
+                context=_context(store),
+                provider=FakeIncomeExpenseProvider(),
+            )
+            correction = store.insert_queue_job(
+                make_job(
+                    update_id=3,
+                    message_id=458,
+                    processing_text="Yeah, the aquarium spend should be removed.",
+                )
+            )
+            assert correction.queue_id is not None
+            store.insert_incoming_message_actions(
+                queue_id=correction.queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_LOG_EXPENSES,),
+            )
+            store.mark_job_done(correction.queue_id, result_json={"ok": True})
+            correction_action = store.claim_next_action(worker_name="worker")
+            assert correction_action is not None
+            store.mark_action_done(
+                int(correction_action["id"]),
+                result_json={"ok": True},
+            )
+            bot = SimpleNamespace(
+                send_message=AsyncMock(return_value=SimpleNamespace(message_id=9002))
+            )
+
+            result = await process_show_income_expense_report(
+                bot,
+                {
+                    "id": 102,
+                    "action_code": "SHOW_ALL",
+                    "chat_id": 123,
+                    "message_id": 789,
+                },
+                context=_context(store),
+            )
+
+            self.assertEqual(result["unprocessed_source_count"], 1)
+            sent_text = bot.send_message.await_args.kwargs["text"]
+            self.assertTrue(
+                sent_text.startswith(
+                    "<b>The calculation below is out-of-date; there are "
+                    "unprocessed voice entries.</b>\n"
+                    "<i>Use /calculate if you wish. We auto-calculate on "
+                    "Sunday 23:59:59 each week.</i>\n\n"
+                )
+            )
+            self.assertIn("<b>APRIL 2026:</b>", sent_text)
+            self.assertEqual(bot.send_message.await_args.kwargs["parse_mode"], "HTML")
+
     async def test_show_all_detailed_keeps_notes(self) -> None:
         with TemporaryDirectory() as tmpdir:
             store, calculation_row = _store_with_mixed_source_and_action(tmpdir)
