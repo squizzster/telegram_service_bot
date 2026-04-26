@@ -1389,6 +1389,20 @@ class SQLiteQueueStore:
     def get_unprocessed_income_expense_source_actions(
         self,
     ) -> tuple[dict[str, Any], ...]:
+        return self.get_recent_income_expense_source_actions(
+            window_start_utc=None,
+            only_unprocessed=True,
+        )
+
+    def get_recent_income_expense_source_actions(
+        self,
+        *,
+        window_start_utc: datetime | str | None,
+        only_unprocessed: bool = False,
+    ) -> tuple[dict[str, Any], ...]:
+        normalized_window_start = _normalize_recalculation_window_start(
+            window_start_utc
+        )
         try:
             with self._connect() as conn:
                 rows = conn.execute(
@@ -1405,7 +1419,8 @@ class SQLiteQueueStore:
                     WHERE ima.action_code IN (?, ?)
                       AND ima.status = ?
                       AND tq.status = ?
-                      AND ima.income_expense_processed_at IS NULL
+                      AND (? = 0 OR ima.income_expense_processed_at IS NULL)
+                      AND (? IS NULL OR datetime(tq.telegram_date) >= datetime(?))
                       AND tq.processing_text IS NOT NULL
                     ORDER BY tq.telegram_date, tq.id, ima.detected_order, ima.id
                     """,
@@ -1414,6 +1429,9 @@ class SQLiteQueueStore:
                         ACTION_LOG_INCOME,
                         ACTION_STATUS_DONE,
                         STATUS_DONE,
+                        1 if only_unprocessed else 0,
+                        normalized_window_start,
+                        normalized_window_start,
                     ),
                 ).fetchall()
         except sqlite3.Error as exc:
@@ -1447,7 +1465,16 @@ class SQLiteQueueStore:
         calculation_action_id: int,
         source_action_ids: tuple[int, ...],
         entries: tuple[Mapping[str, Any], ...],
+        recalculation_window_start_utc: datetime | str | None = None,
     ) -> tuple[dict[str, Any], ...]:
+        normalized_window_start = _normalize_recalculation_window_start(
+            recalculation_window_start_utc
+        )
+        parsed_window_start = (
+            _parse_sqlite_datetime(normalized_window_start)
+            if normalized_window_start is not None
+            else None
+        )
         conn: sqlite3.Connection | None = None
         try:
             conn = self._connect()
@@ -1461,11 +1488,17 @@ class SQLiteQueueStore:
                         ima.id AS action_id,
                         ima.queue_id AS entry_id,
                         ima.action_code,
-                        ima.income_expense_processed_at
+                        ima.income_expense_processed_at,
+                        tq.telegram_date AS date_time_utc
                     FROM incoming_message_actions AS ima
+                    JOIN telegram_queue AS tq
+                      ON tq.id = ima.queue_id
                     WHERE ima.id IN ({placeholders})
                       AND ima.action_code IN (?, ?)
                       AND ima.status = ?
+                      AND tq.status = ?
+                      AND tq.processing_text IS NOT NULL
+                      AND (? IS NULL OR datetime(tq.telegram_date) >= datetime(?))
                     ORDER BY ima.id
                     """,
                     (
@@ -1473,20 +1506,27 @@ class SQLiteQueueStore:
                         ACTION_LOG_EXPENSES,
                         ACTION_LOG_INCOME,
                         ACTION_STATUS_DONE,
+                        STATUS_DONE,
+                        normalized_window_start,
+                        normalized_window_start,
                     ),
                 ).fetchall()
                 if len(source_rows) != len(set(source_action_ids)):
-                    raise QueueStoreError("income/expense source action disappeared")
-                already_processed = [
-                    row["action_id"]
-                    for row in source_rows
-                    if row["income_expense_processed_at"] is not None
-                ]
-                if already_processed:
                     raise QueueStoreError(
-                        "income/expense source action already processed ids="
-                        + ",".join(str(item) for item in already_processed)
+                        "income/expense source action disappeared or is outside "
+                        "the recalculation window"
                     )
+                if normalized_window_start is None:
+                    already_processed = [
+                        row["action_id"]
+                        for row in source_rows
+                        if row["income_expense_processed_at"] is not None
+                    ]
+                    if already_processed:
+                        raise QueueStoreError(
+                            "income/expense source action already processed ids="
+                            + ",".join(str(item) for item in already_processed)
+                        )
             else:
                 source_rows = []
                 if entries:
@@ -1497,9 +1537,27 @@ class SQLiteQueueStore:
             source_action_by_entry_direction = _source_action_by_entry_direction(
                 source_rows
             )
+            if normalized_window_start is not None:
+                conn.execute(
+                    """
+                    DELETE FROM incoming_outgoing_expenses
+                    WHERE datetime(entry_date_time_utc) >= datetime(?)
+                    """,
+                    (normalized_window_start,),
+                )
+
             inserted_ids: list[int] = []
             for result_order, entry in enumerate(entries):
                 normalized_entry = _normalize_income_expense_entry(entry)
+                if parsed_window_start is not None:
+                    entry_datetime = _parse_sqlite_datetime(
+                        str(normalized_entry["date_time_utc"])
+                    )
+                    if entry_datetime < parsed_window_start:
+                        raise QueueStoreError(
+                            "income/expense entry is outside the recalculation "
+                            f"window entry_id={normalized_entry['entry_id']}"
+                        )
                 source_action_id = source_action_by_entry_direction.get(
                     (
                         int(normalized_entry["entry_id"]),
@@ -1561,7 +1619,7 @@ class SQLiteQueueStore:
                     WHERE id IN ({placeholders})
                       AND action_code IN (?, ?)
                       AND status = ?
-                      AND income_expense_processed_at IS NULL
+                      AND (? IS NOT NULL OR income_expense_processed_at IS NULL)
                     """,
                     (
                         calculation_action_id,
@@ -1569,6 +1627,7 @@ class SQLiteQueueStore:
                         ACTION_LOG_EXPENSES,
                         ACTION_LOG_INCOME,
                         ACTION_STATUS_DONE,
+                        normalized_window_start,
                     ),
                 )
                 if cursor.rowcount != len(set(source_action_ids)):
@@ -2682,6 +2741,7 @@ def _select_action_job(
             tq.chat_type AS chat_type,
             tq.message_id AS message_id,
             tq.message_thread_id AS message_thread_id,
+            tq.telegram_date AS source_telegram_date,
             tq.processing_text AS processing_text,
             tq.payload_json AS source_payload_json,
             tq.raw_update_json AS source_raw_update_json,
@@ -2854,6 +2914,16 @@ def _income_expense_week(date_time_utc: str) -> tuple[int, int]:
     parsed = _parse_sqlite_datetime(date_time_utc)
     iso_year, iso_week, _ = parsed.isocalendar()
     return int(iso_year), int(iso_week)
+
+
+def _normalize_recalculation_window_start(
+    value: datetime | str | None,
+) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return _sqlite_timestamp(value)
+    return _sqlite_timestamp(_parse_sqlite_datetime(str(value)))
 
 
 def _source_action_by_entry_direction(

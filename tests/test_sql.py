@@ -943,6 +943,142 @@ class SQLiteQueueStoreTests(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(processed_count, 2)
 
+    def test_income_expense_recalculation_replaces_recent_rows(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.sqlite"
+            store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
+            store.create_schema(create_parent_dir=True)
+            income = store.insert_queue_job(
+                make_job(
+                    update_id=1,
+                    message_id=456,
+                    processing_text="I have earned 300.",
+                )
+            )
+            first_command = store.insert_queue_job(
+                make_job(
+                    update_id=2,
+                    message_id=457,
+                    processing_text="/calculate",
+                )
+            )
+            assert income.queue_id is not None
+            assert first_command.queue_id is not None
+            store.insert_incoming_message_actions(
+                queue_id=income.queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_LOG_INCOME,),
+            )
+            store.insert_incoming_message_actions(
+                queue_id=first_command.queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_CALCULATE_INCOME_EXPENSES,),
+            )
+            store.mark_job_done(income.queue_id, result_json={"ok": True})
+            store.mark_job_done(first_command.queue_id, result_json={"ok": True})
+            income_action = store.claim_next_action(worker_name="worker")
+            first_calculation = store.claim_next_action(worker_name="worker")
+            assert income_action is not None
+            assert first_calculation is not None
+            store.mark_action_done(int(income_action["id"]), result_json={"ok": True})
+            first_sources = store.get_unprocessed_income_expense_source_actions()
+            store.record_income_expense_calculation(
+                calculation_action_id=int(first_calculation["id"]),
+                source_action_ids=tuple(
+                    int(source["action_id"]) for source in first_sources
+                ),
+                entries=(
+                    {
+                        "entry_id": income.queue_id,
+                        "date_time_utc": "2026-04-23 18:42:37",
+                        "direction": "incoming",
+                        "description": "Earnings",
+                        "notes": "",
+                        "price_value": "300",
+                    },
+                ),
+                recalculation_window_start_utc="2026-04-16 18:42:37",
+            )
+            store.mark_action_done(
+                int(first_calculation["id"]),
+                result_json={"ok": True},
+            )
+
+            correction = store.insert_queue_job(
+                make_job(
+                    update_id=3,
+                    message_id=458,
+                    processing_text="Yeah, the earnings 300 should be removed.",
+                )
+            )
+            second_command = store.insert_queue_job(
+                make_job(
+                    update_id=4,
+                    message_id=459,
+                    processing_text="/calculate",
+                )
+            )
+            assert correction.queue_id is not None
+            assert second_command.queue_id is not None
+            store.insert_incoming_message_actions(
+                queue_id=correction.queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_LOG_INCOME,),
+            )
+            store.insert_incoming_message_actions(
+                queue_id=second_command.queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_CALCULATE_INCOME_EXPENSES,),
+            )
+            store.mark_job_done(correction.queue_id, result_json={"ok": True})
+            store.mark_job_done(second_command.queue_id, result_json={"ok": True})
+            correction_action = store.claim_next_action(worker_name="worker")
+            second_calculation = store.claim_next_action(worker_name="worker")
+            assert correction_action is not None
+            assert second_calculation is not None
+            store.mark_action_done(
+                int(correction_action["id"]),
+                result_json={"ok": True},
+            )
+
+            second_sources = store.get_recent_income_expense_source_actions(
+                window_start_utc="2026-04-16 18:42:37",
+            )
+            inserted = store.record_income_expense_calculation(
+                calculation_action_id=int(second_calculation["id"]),
+                source_action_ids=tuple(
+                    int(source["action_id"]) for source in second_sources
+                ),
+                entries=(),
+                recalculation_window_start_utc="2026-04-16 18:42:37",
+            )
+
+            self.assertEqual(inserted, ())
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                ledger_count = conn.execute(
+                    "SELECT COUNT(*) FROM incoming_outgoing_expenses"
+                ).fetchone()[0]
+                processed_rows = conn.execute(
+                    """
+                    SELECT income_expense_processed_by_action_id
+                    FROM incoming_message_actions
+                    WHERE action_code = ?
+                    ORDER BY id
+                    """,
+                    (ACTION_LOG_INCOME,),
+                ).fetchall()
+            self.assertEqual(ledger_count, 0)
+            self.assertEqual(
+                [
+                    row["income_expense_processed_by_action_id"]
+                    for row in processed_rows
+                ],
+                [int(second_calculation["id"]), int(second_calculation["id"])],
+            )
+
     def test_get_income_expense_rows_for_week_filters_latest_by_direction(self) -> None:
         with TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "queue.sqlite"

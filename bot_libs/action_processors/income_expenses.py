@@ -8,7 +8,7 @@ import json
 import logging
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -38,6 +38,7 @@ from bot_libs.telegram_error_policy import job_error_from_telegram_error
 from bot_libs.telegram_message_utils import split_telegram_text
 
 log = logging.getLogger(__name__)
+RECALCULATION_LOOKBACK_DAYS = 7
 
 IncomeExpenseCalculationProvider = Callable[
     ...,
@@ -82,8 +83,13 @@ async def process_calculate_income_expenses(
             "message_ids": message_ids,
         }
 
+    calculation_reference_utc = _calculation_reference_datetime(row)
+    recalculation_window_start_utc = calculation_reference_utc - timedelta(
+        days=RECALCULATION_LOOKBACK_DAYS
+    )
     source_rows = await asyncio.to_thread(
-        queue_store.get_unprocessed_income_expense_source_actions
+        queue_store.get_recent_income_expense_source_actions,
+        window_start_utc=recalculation_window_start_utc,
     )
     if not source_rows:
         message_ids = await _send_action_message(
@@ -91,7 +97,7 @@ async def process_calculate_income_expenses(
             row,
             context=context,
             outbound_kind="income_expense_calculation",
-            message_text="No unprocessed income or expense entries found.",
+            message_text="No income or expense entries found in the last 7 days.",
         )
         return {
             "outcome": "processed",
@@ -111,6 +117,7 @@ async def process_calculate_income_expenses(
         calculation_action_id=action_job_id,
         source_action_ids=tuple(int(item["action_id"]) for item in source_rows),
         entries=provider_result.entries,
+        recalculation_window_start_utc=recalculation_window_start_utc,
     )
 
     message_text = _format_calculation_summary(
@@ -133,6 +140,10 @@ async def process_calculate_income_expenses(
         "prompt_id": provider_result.prompt_id,
         "source_action_count": len(source_rows),
         "inserted_count": len(inserted_rows),
+        "recalculation_lookback_days": RECALCULATION_LOOKBACK_DAYS,
+        "recalculation_window_start_utc": _display_timestamp(
+            recalculation_window_start_utc.isoformat()
+        ),
         "messy_csv_data": messy_csv_data,
         "raw_response": provider_result.raw_response,
         "message_ids": message_ids,
@@ -247,6 +258,28 @@ def _direction_for_source_action(action_code: str) -> str:
     if action_code == ACTION_LOG_EXPENSES:
         return "outgoing"
     raise RetryableJobError(f"unsupported income/expense source action {action_code!r}")
+
+
+def _calculation_reference_datetime(row: Mapping[str, object]) -> datetime:
+    raw_value = row.get("source_telegram_date") or row.get("telegram_date")
+    if raw_value is None:
+        return datetime.now(timezone.utc)
+
+    text = str(raw_value).strip()
+    if not text:
+        return datetime.now(timezone.utc)
+
+    try:
+        if "T" in text or text.endswith("Z") or "+" in text:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        else:
+            parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return datetime.now(timezone.utc)
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _report_direction_for_action(action_code: str) -> str | None:

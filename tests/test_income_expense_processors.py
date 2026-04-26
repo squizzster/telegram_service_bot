@@ -84,6 +84,29 @@ class CrossMonthIncomeExpenseProvider:
         )
 
 
+class RemovingIncomeProvider:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def __call__(self, *, messy_csv_data: str) -> IncomeExpenseCalculationResult:
+        self.calls.append(messy_csv_data)
+        return IncomeExpenseCalculationResult(
+            provider="fake",
+            prompt_id="prompt-calc",
+            entries=(
+                {
+                    "entry_id": 1,
+                    "date_time_utc": "2026-04-26 14:43:23",
+                    "direction": "outgoing",
+                    "description": "Aquarium",
+                    "notes": "",
+                    "price_value": "56",
+                },
+            ),
+            raw_response={"entries": []},
+        )
+
+
 class IncomeExpenseProcessorTests(unittest.IsolatedAsyncioTestCase):
     async def test_calculate_records_source_rows_and_sends_summary(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -109,6 +132,73 @@ class IncomeExpenseProcessorTests(unittest.IsolatedAsyncioTestCase):
             )
             bot.send_message.assert_awaited_once()
             self.assertIn("Calculation complete", bot.send_message.await_args.kwargs["text"])
+
+    async def test_calculate_reprocesses_recent_sources_for_corrections(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            store, first_calculation_row = _store_with_mixed_source_and_action(tmpdir)
+            await process_calculate_income_expenses(
+                SimpleNamespace(
+                    send_message=AsyncMock(return_value=SimpleNamespace(message_id=9001))
+                ),
+                first_calculation_row,
+                context=_context(store),
+                provider=FakeIncomeExpenseProvider(),
+            )
+
+            correction = store.insert_queue_job(
+                make_job(
+                    update_id=3,
+                    message_id=458,
+                    processing_text="Yeah, the earnings 160 should be removed.",
+                )
+            )
+            command = store.insert_queue_job(
+                make_job(update_id=4, message_id=459, processing_text="/calculate")
+            )
+            assert correction.queue_id is not None
+            assert command.queue_id is not None
+            store.insert_incoming_message_actions(
+                queue_id=correction.queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_LOG_INCOME,),
+            )
+            store.insert_incoming_message_actions(
+                queue_id=command.queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_CALCULATE_INCOME_EXPENSES,),
+            )
+            store.mark_job_done(correction.queue_id, result_json={"ok": True})
+            store.mark_job_done(command.queue_id, result_json={"ok": True})
+            correction_action = store.claim_next_action(worker_name="worker")
+            second_calculation_row = store.claim_next_action(worker_name="worker")
+            assert correction_action is not None
+            assert second_calculation_row is not None
+            store.mark_action_done(int(correction_action["id"]), result_json={"ok": True})
+            provider = RemovingIncomeProvider()
+
+            result = await process_calculate_income_expenses(
+                SimpleNamespace(
+                    send_message=AsyncMock(return_value=SimpleNamespace(message_id=9002))
+                ),
+                second_calculation_row,
+                context=_context(store),
+                provider=provider,
+            )
+
+            self.assertEqual(result["inserted_count"], 1)
+            self.assertIn(
+                "Earned 160 putting up TVs, spent 56 on my aquarium.",
+                provider.calls[0],
+            )
+            self.assertIn(
+                "Yeah, the earnings 160 should be removed.",
+                provider.calls[0],
+            )
+            income_rows = store.get_income_expense_rows_for_week(direction="incoming")
+            expense_rows = store.get_income_expense_rows_for_week(direction="outgoing")
+            self.assertEqual(income_rows, ())
+            self.assertEqual(len(expense_rows), 1)
+            self.assertEqual(expense_rows[0]["description"], "Aquarium")
 
     async def test_show_expenses_reads_processed_table_only(self) -> None:
         with TemporaryDirectory() as tmpdir:
