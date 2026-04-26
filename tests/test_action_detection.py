@@ -92,6 +92,7 @@ class ActionDetectionServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_detect_actions_maps_direct_commands_without_provider(self) -> None:
         cases = (
             ("/calculate", ACTION_CALCULATE_INCOME_EXPENSES),
+            ("/calculate_force", ACTION_CALCULATE_INCOME_EXPENSES),
             ("/calc extra text", ACTION_CALCULATE_INCOME_EXPENSES),
             ("/show_expenses@my_bot", ACTION_SHOW_EXPENSES),
             ("/show_all_detailed", ACTION_SHOW_ALL_DETAILED),

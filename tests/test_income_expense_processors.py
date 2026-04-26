@@ -200,6 +200,75 @@ class IncomeExpenseProcessorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(expense_rows), 1)
             self.assertEqual(expense_rows[0]["description"], "Aquarium")
 
+    async def test_calculate_without_unprocessed_sources_suggests_force(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            store, first_calculation_row = _store_with_mixed_source_and_action(tmpdir)
+            await process_calculate_income_expenses(
+                SimpleNamespace(
+                    send_message=AsyncMock(return_value=SimpleNamespace(message_id=9001))
+                ),
+                first_calculation_row,
+                context=_context(store),
+                provider=FakeIncomeExpenseProvider(),
+            )
+            second_calculation_row = _insert_claimed_calculation_command(
+                store,
+                update_id=3,
+                message_id=458,
+                processing_text="/calculate",
+            )
+            provider = FakeIncomeExpenseProvider()
+            bot = SimpleNamespace(
+                send_message=AsyncMock(return_value=SimpleNamespace(message_id=9002))
+            )
+
+            result = await process_calculate_income_expenses(
+                bot,
+                second_calculation_row,
+                context=_context(store),
+                provider=provider,
+            )
+
+            self.assertEqual(provider.calls, [])
+            self.assertEqual(result["inserted_count"], 0)
+            self.assertFalse(result["force_recalculation"])
+            sent_text = bot.send_message.await_args.kwargs["text"]
+            self.assertIn("No unprocessed income or expense voice entries found.", sent_text)
+            self.assertIn("/calculate_force", sent_text)
+
+    async def test_calculate_force_reprocesses_without_unprocessed_sources(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            store, first_calculation_row = _store_with_mixed_source_and_action(tmpdir)
+            await process_calculate_income_expenses(
+                SimpleNamespace(
+                    send_message=AsyncMock(return_value=SimpleNamespace(message_id=9001))
+                ),
+                first_calculation_row,
+                context=_context(store),
+                provider=FakeIncomeExpenseProvider(),
+            )
+            second_calculation_row = _insert_claimed_calculation_command(
+                store,
+                update_id=3,
+                message_id=458,
+                processing_text="/calculate_force",
+            )
+            provider = FakeIncomeExpenseProvider()
+
+            result = await process_calculate_income_expenses(
+                SimpleNamespace(
+                    send_message=AsyncMock(return_value=SimpleNamespace(message_id=9002))
+                ),
+                second_calculation_row,
+                context=_context(store),
+                provider=provider,
+            )
+
+            self.assertEqual(len(provider.calls), 1)
+            self.assertEqual(result["inserted_count"], 2)
+            self.assertEqual(result["unprocessed_source_count"], 0)
+            self.assertTrue(result["force_recalculation"])
+
     async def test_show_expenses_reads_processed_table_only(self) -> None:
         with TemporaryDirectory() as tmpdir:
             store, calculation_row = _store_with_mixed_source_and_action(tmpdir)
@@ -405,6 +474,32 @@ def _store_with_mixed_source_and_action(tmpdir: str) -> tuple[SQLiteQueueStore, 
     store.mark_action_done(int(income_source["id"]), result_json={"ok": True})
     store.mark_action_done(int(expense_source["id"]), result_json={"ok": True})
     return store, calculation_row
+
+
+def _insert_claimed_calculation_command(
+    store: SQLiteQueueStore,
+    *,
+    update_id: int,
+    message_id: int,
+    processing_text: str,
+) -> dict[str, object]:
+    command = store.insert_queue_job(
+        make_job(
+            update_id=update_id,
+            message_id=message_id,
+            processing_text=processing_text,
+        )
+    )
+    assert command.queue_id is not None
+    store.insert_incoming_message_actions(
+        queue_id=command.queue_id,
+        detection_run_id=None,
+        action_codes=(ACTION_CALCULATE_INCOME_EXPENSES,),
+    )
+    store.mark_job_done(command.queue_id, result_json={"ok": True})
+    calculation_row = store.claim_next_action(worker_name="worker")
+    assert calculation_row is not None
+    return calculation_row
 
 
 def _context(store: SQLiteQueueStore) -> ActionProcessingContext:

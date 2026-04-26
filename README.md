@@ -97,6 +97,7 @@ Direct command actions bypass the classifier:
 | Command          | Action code                       |
 | ---------------- | --------------------------------- |
 | `/calculate`     | `CALCULATE_INCOME_EXPENSES`       |
+| `/calculate_force` | `CALCULATE_INCOME_EXPENSES`     |
 | `/calc`          | `CALCULATE_INCOME_EXPENSES`       |
 | `/show_expenses` | `SHOW_EXPENSES`                   |
 | `/show_income`   | `SHOW_INCOME`                     |

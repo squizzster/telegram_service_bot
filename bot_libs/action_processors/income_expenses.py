@@ -55,6 +55,7 @@ async def process_calculate_income_expenses(
 ) -> dict[str, object]:
     queue_store = _queue_store(context)
     action_job_id = _row_int(row, "id")
+    force_recalculation = _is_force_calculation_command(row)
 
     existing_rows = await asyncio.to_thread(
         queue_store.get_income_expense_rows_for_calculation_action,
@@ -87,6 +88,32 @@ async def process_calculate_income_expenses(
     recalculation_window_start_utc = calculation_reference_utc - timedelta(
         days=RECALCULATION_LOOKBACK_DAYS
     )
+    unprocessed_source_rows = await asyncio.to_thread(
+        queue_store.get_recent_income_expense_source_actions,
+        window_start_utc=recalculation_window_start_utc,
+        only_unprocessed=True,
+    )
+    if not force_recalculation and not unprocessed_source_rows:
+        message_ids = await _send_action_message(
+            bot,
+            row,
+            context=context,
+            outbound_kind="income_expense_calculation",
+            message_text=(
+                "No unprocessed income or expense voice entries found.\n"
+                "Use /calculate_force to recalculate the last 7 days anyway."
+            ),
+        )
+        return {
+            "outcome": "processed",
+            "processor": "income_expense_calculation",
+            "action_code": ACTION_CALCULATE_INCOME_EXPENSES,
+            "source_action_count": 0,
+            "inserted_count": 0,
+            "force_recalculation": False,
+            "message_ids": message_ids,
+        }
+
     source_rows = await asyncio.to_thread(
         queue_store.get_recent_income_expense_source_actions,
         window_start_utc=recalculation_window_start_utc,
@@ -140,6 +167,8 @@ async def process_calculate_income_expenses(
         "prompt_id": provider_result.prompt_id,
         "source_action_count": len(source_rows),
         "inserted_count": len(inserted_rows),
+        "unprocessed_source_count": len(unprocessed_source_rows),
+        "force_recalculation": force_recalculation,
         "recalculation_lookback_days": RECALCULATION_LOOKBACK_DAYS,
         "recalculation_window_start_utc": _display_timestamp(
             recalculation_window_start_utc.isoformat()
@@ -272,6 +301,15 @@ def _direction_for_source_action(action_code: str) -> str:
     if action_code == ACTION_LOG_EXPENSES:
         return "outgoing"
     raise RetryableJobError(f"unsupported income/expense source action {action_code!r}")
+
+
+def _is_force_calculation_command(row: Mapping[str, object]) -> bool:
+    processing_text = str(row.get("processing_text") or "").strip().lower()
+    if not processing_text:
+        return False
+    first_token = processing_text.split(maxsplit=1)[0]
+    command_name = first_token.split("@", 1)[0]
+    return command_name == "/calculate_force"
 
 
 def _calculation_reference_datetime(row: Mapping[str, object]) -> datetime:

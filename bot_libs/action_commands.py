@@ -29,6 +29,11 @@ COMMAND_ACTIONS: dict[str, DirectActionCommand] = {
         action_code=ACTION_CALCULATE_INCOME_EXPENSES,
         provider_label=ACTION_PROVIDER_CALCULATE_INCOME_EXPENSES,
     ),
+    "/calculate_force": DirectActionCommand(
+        command="/calculate_force",
+        action_code=ACTION_CALCULATE_INCOME_EXPENSES,
+        provider_label=ACTION_PROVIDER_CALCULATE_INCOME_EXPENSES,
+    ),
     "/calc": DirectActionCommand(
         command="/calc",
         action_code=ACTION_CALCULATE_INCOME_EXPENSES,
