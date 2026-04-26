@@ -18,7 +18,12 @@ if __package__ in {None, ""}:
 
 from telegram import Bot  # noqa: E402
 
+from bot_libs.action_commands import direct_action_command_for_text  # noqa: E402
 from bot_libs.action_detection import ActionDetectionService  # noqa: E402
+from bot_libs.action_models import (  # noqa: E402
+    ACTION_DETECTION_PENDING,
+    ACTION_DETECTION_PROCESSING,
+)
 from bot_libs.daemon_signal import (  # noqa: E402
     DAEMON_PROCESS_NAME,
     resolve_daemon_pidfile,
@@ -58,6 +63,7 @@ from bot_libs.reaction_policy import (  # noqa: E402
     REACTION_FAILURE,
     REACTION_SUCCESS,
     REACTION_UNSUPPORTED,
+    reaction_for_stage,
     reaction_for_row_state,
     retry_reaction_for_delay,
     set_row_reaction,
@@ -71,6 +77,7 @@ from bot_libs.runtime_checks import (  # noqa: E402
     run_runtime_system_checks,
 )
 from bot_libs.stage_names import (  # noqa: E402
+    STAGE_DETECTING_ACTIONS,
     STAGE_FAILED,
     STAGE_MESSAGE_REMOVED,
     STAGE_UNSUPPORTED,
@@ -328,6 +335,7 @@ class QueueDaemon:
                     f"queue job disappeared after processing id={job_id}"
                 )
             action_result = await self._maybe_detect_actions(
+                bot,
                 latest_row,
                 processor_result=processor_result,
             )
@@ -512,11 +520,28 @@ class QueueDaemon:
 
     async def _maybe_detect_actions(
         self,
+        bot: Bot,
         row: dict[str, object],
         *,
         processor_result: Mapping[str, object],
     ) -> dict[str, object]:
         del processor_result
+        if _should_show_action_detection_prompt_reaction(row):
+            emoji = reaction_for_stage(STAGE_DETECTING_ACTIONS)
+            if emoji is not None:
+                reaction_set = await set_row_reaction(
+                    bot,
+                    row,
+                    emoji,
+                    reason="action_detection_prompt",
+                )
+                if not reaction_set:
+                    log.debug(
+                        "Action detection prompt reaction was not updated for "
+                        "queue job id=%s emoji=%s",
+                        row.get("id"),
+                        emoji,
+                    )
         return await self.action_detector.detect_actions(row)
 
     async def _maybe_send_deferred_transcript_reply(
@@ -1089,6 +1114,18 @@ def _row_text(
     if value is None:
         raise ValueError(f"Queue row field {key!r} is missing")
     return str(value)
+
+
+def _should_show_action_detection_prompt_reaction(row: Mapping[str, object]) -> bool:
+    status = row.get("action_detection_status")
+    if status not in {ACTION_DETECTION_PENDING, ACTION_DETECTION_PROCESSING}:
+        return False
+
+    processing_text = row.get("processing_text")
+    if not isinstance(processing_text, str) or not processing_text.strip():
+        return False
+
+    return direct_action_command_for_text(processing_text) is None
 
 
 def _row_is_supported(row: Mapping[str, object]) -> bool:

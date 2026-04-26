@@ -16,6 +16,8 @@ from bot_libs.logging_utils import TRACE_LEVEL
 from bot_libs.queue_models import STATUS_DEAD, STATUS_DONE
 from bot_libs.retry_policy import RETRY_MEDIUM_MAX_SECONDS, RETRY_SHORT_MAX_SECONDS
 from bot_libs.stage_names import (
+    STAGE_ANSWERING_QUESTION,
+    STAGE_CALCULATING_INCOME_EXPENSES,
     STAGE_CALLING_STT_API,
     STAGE_DETECTING_ACTIONS,
     STAGE_DONE,
@@ -38,6 +40,7 @@ _REACTION_RATE_LIMIT_SUPPRESSED_UNTIL: dict[object, float] = {}
 
 REACTION_ACCEPTED = "👀"
 REACTION_DOWNLOADING_FILE = "⚡"
+REACTION_AI_PROMPT = "⚡"
 REACTION_CALLING_STT_API = "✍"
 REACTION_SUCCESS = "👌"
 REACTION_UNSUPPORTED = "🤷"
@@ -124,6 +127,15 @@ VALID_REACTION_EMOJIS = frozenset(
     }
 )
 
+AI_PROMPT_REACTION_STAGES = frozenset(
+    {
+        STAGE_ANSWERING_QUESTION,
+        STAGE_CALCULATING_INCOME_EXPENSES,
+        STAGE_CALLING_STT_API,
+        STAGE_DETECTING_ACTIONS,
+    }
+)
+
 REACTION_ELIGIBLE_CHAT_TYPES = frozenset(
     {
         ChatType.GROUP.value,
@@ -151,6 +163,17 @@ def retry_reaction_for_delay(delay_seconds: int) -> str:
     return REACTION_RETRY_LONG
 
 
+def reaction_for_stage(stage: object) -> str | None:
+    normalized_stage = _row_text(stage)
+    if normalized_stage in AI_PROMPT_REACTION_STAGES:
+        return REACTION_AI_PROMPT
+    if normalized_stage == STAGE_DOWNLOADING_FILE:
+        return REACTION_DOWNLOADING_FILE
+    if normalized_stage == STAGE_SENDING_RESPONSE:
+        return REACTION_CALLING_STT_API
+    return None
+
+
 def reaction_for_row_state(row: Mapping[str, object]) -> str | None:
     status = _row_text(row.get("status"))
     stage = _row_text(row.get("stage"))
@@ -165,10 +188,9 @@ def reaction_for_row_state(row: Mapping[str, object]) -> str | None:
         return REACTION_FAILURE
     if stage == STAGE_RETRY_WAITING:
         return retry_reaction_for_delay(_retry_delay_seconds_from_row(row))
-    if stage == STAGE_DOWNLOADING_FILE:
-        return REACTION_DOWNLOADING_FILE
-    if stage in {STAGE_CALLING_STT_API, STAGE_SENDING_RESPONSE, STAGE_DETECTING_ACTIONS}:
-        return REACTION_CALLING_STT_API
+    stage_reaction = reaction_for_stage(stage)
+    if stage_reaction is not None:
+        return stage_reaction
     if stage in {STAGE_QUEUED, STAGE_READY_TO_PROCESS, None}:
         return REACTION_ACCEPTED
     return REACTION_ACCEPTED

@@ -7,7 +7,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from bot_libs.sql import SQLiteSettings
-from bot_libs.stage_names import STAGE_FAILED, STAGE_PROCESSING_ACTION
+from bot_libs.stage_names import (
+    STAGE_ANSWERING_QUESTION,
+    STAGE_FAILED,
+    STAGE_PROCESSING_ACTION,
+)
 import telegram_action_daemon as daemon
 
 
@@ -127,6 +131,19 @@ class ContextProcessor(daemon.ActionProcessor):
         await context.set_stage(STAGE_PROCESSING_ACTION)
         await context.set_outbound_json({"message_ids": [1]}, STAGE_PROCESSING_ACTION)
         return {"processor": "context"}
+
+
+class AiPromptStageProcessor(daemon.ActionProcessor):
+    async def process(
+        self,
+        bot: object,
+        row: dict[str, object],
+        *,
+        context: object = None,
+    ) -> dict[str, object]:
+        del bot, row
+        await context.set_stage(STAGE_ANSWERING_QUESTION)
+        return {"processor": "ai-prompt-stage"}
 
 
 class RetryProcessor(daemon.ActionProcessor):
@@ -305,6 +322,27 @@ class TelegramActionDaemonTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         )
+
+    @patch("telegram_action_daemon.asyncio.to_thread", new=immediate_to_thread)
+    async def test_process_one_action_sets_lightning_for_ai_prompt_stage(self) -> None:
+        store = FakeActionStore()
+        bot = self.make_bot()
+        worker = daemon.ActionDaemon(
+            config=self.make_config(),
+            queue_store=store,
+            processor=AiPromptStageProcessor(),
+        )
+
+        await worker.process_one_action(
+            bot,
+            self.make_row(action_code="ANSWER_QUESTION"),
+        )
+
+        self.assertEqual(
+            store.stage_calls,
+            [{"action_job_id": 7, "stage": STAGE_ANSWERING_QUESTION}],
+        )
+        self.assertEqual(bot.reactions, ["✍", "⚡", "👌"])
 
     @patch("telegram_action_daemon.asyncio.to_thread", new=immediate_to_thread)
     async def test_process_one_action_schedules_retry_and_sets_retry_reaction(self) -> None:

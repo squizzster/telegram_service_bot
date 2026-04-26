@@ -39,6 +39,7 @@ from bot_libs.reaction_policy import (  # noqa: E402
     REACTION_CALLING_STT_API,
     REACTION_FAILURE,
     REACTION_SUCCESS,
+    reaction_for_stage,
     retry_reaction_for_delay,
     set_row_reaction,
 )
@@ -234,7 +235,7 @@ class ActionDaemon:
             result = await self.processor.process(
                 bot,
                 row,
-                context=self._build_processing_context(action_job_id),
+                context=self._build_processing_context(action_job_id, bot=bot, row=row),
             )
         except OriginalMessageUnavailableError as exc:
             log.debug(
@@ -566,7 +567,13 @@ class ActionDaemon:
                 REACTION_CALLING_STT_API,
             )
 
-    def _build_processing_context(self, action_job_id: int) -> ActionProcessingContext:
+    def _build_processing_context(
+        self,
+        action_job_id: int,
+        *,
+        bot: Bot,
+        row: Mapping[str, object],
+    ) -> ActionProcessingContext:
         async def set_stage(stage: str) -> None:
             log.debug("action_job=%s stage=%s", action_job_id, stage)
             await asyncio.to_thread(
@@ -574,6 +581,22 @@ class ActionDaemon:
                 action_job_id,
                 stage=stage,
             )
+            stage_reaction = reaction_for_stage(stage)
+            if stage_reaction is not None:
+                reaction_set = await set_row_reaction(
+                    bot,
+                    row,
+                    stage_reaction,
+                    reason=f"action_stage:{stage}",
+                )
+                if not reaction_set:
+                    log.debug(
+                        "Stage reaction was not updated for action job id=%s "
+                        "stage=%s emoji=%s",
+                        action_job_id,
+                        stage,
+                        stage_reaction,
+                    )
 
         async def set_outbound_json(
             outbound_json: dict[str, Any],

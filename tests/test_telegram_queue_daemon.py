@@ -530,6 +530,37 @@ class TelegramQueueDaemonTests(unittest.IsolatedAsyncioTestCase):
         )
 
     @patch("telegram_queue_daemon.asyncio.to_thread", new=immediate_to_thread)
+    async def test_process_one_row_sets_lightning_for_llm_action_detection(self) -> None:
+        store = FakeQueueStore()
+        action_detector = RecordingActionDetector(
+            {
+                "status": "complete",
+                "provider_labels": [],
+                "action_codes": [],
+                "created_action_count": 0,
+                "none": True,
+            }
+        )
+        reactions: list[str] = []
+
+        async def record_reaction(**kwargs: object) -> bool:
+            reactions.append(str(kwargs["reaction"]))
+            return True
+
+        bot = SimpleNamespace(set_message_reaction=AsyncMock(side_effect=record_reaction))
+        row = self.make_row(action_detection_status="pending")
+        store.rows[42] = dict(row)
+        worker = daemon.QueueDaemon(
+            config=self.make_config(),
+            queue_store=store,
+            action_detector=action_detector,
+        )
+
+        await worker.process_one_row(bot, row)
+
+        self.assertEqual(reactions, ["⚡", "👌"])
+
+    @patch("telegram_queue_daemon.asyncio.to_thread", new=immediate_to_thread)
     async def test_process_one_row_reloads_latest_row_before_action_detection(self) -> None:
         store = FakeQueueStore()
         action_detector = RecordingActionDetector()
@@ -676,7 +707,7 @@ class TelegramQueueDaemonTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         )
-        self.assertEqual(reactions, ["✍", "👌"])
+        self.assertEqual(reactions, ["⚡", "👌"])
 
     @patch("telegram_queue_daemon.asyncio.to_thread", new=immediate_to_thread)
     async def test_process_one_row_marks_unsupported_rows_done(self) -> None:

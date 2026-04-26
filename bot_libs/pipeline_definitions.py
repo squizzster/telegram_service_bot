@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from bot_libs.reaction_policy import (
-    REACTION_CALLING_STT_API,
+    REACTION_AI_PROMPT,
     REACTION_DOWNLOADING_FILE,
     VALID_REACTION_EMOJIS,
 )
@@ -45,8 +45,8 @@ DEFAULT_STAGE_STATUS_DEFINITIONS: dict[str, StageStatusDefinition] = {
     ),
     STAGE_CALLING_STT_API: StageStatusDefinition(
         stage=STAGE_CALLING_STT_API,
-        reaction=REACTION_CALLING_STT_API,
-        pulse_reactions=(REACTION_CALLING_STT_API, REACTION_DOWNLOADING_FILE),
+        reaction=REACTION_AI_PROMPT,
+        pulse_reactions=(REACTION_AI_PROMPT, REACTION_AI_PROMPT),
         pulse_interval_seconds=7.0,
     ),
 }
