@@ -79,13 +79,29 @@ Telegram update
 
 The current action catalog is:
 
-| Internal code       | Provider label        | Current processor                          |
-| ------------------- | --------------------- | ------------------------------------------ |
-| `NONE`              | `none`                | No child action row is created             |
-| `LOG_EXPENSES`      | `reporting_expenses`  | Temporary retry/success test processor     |
-| `LOG_INCOME`        | `reporting_income`    | Temporary retry/success test processor     |
-| `SET_REMINDER`      | `set_a_reminder`      | Temporary retry/success test processor     |
-| `ANSWER_QUESTION`   | `asking_a_question`   | OpenAI-backed question answering processor |
+| Internal code                   | Provider label                | Enabled | Current processor                                      |
+| ------------------------------- | ----------------------------- | ------- | ------------------------------------------------------ |
+| `NONE`                          | `none`                        | Yes     | No child action row is created                         |
+| `LOG_EXPENSES`                  | `reporting_expenses`          | Yes     | Temporary deterministic success processor              |
+| `LOG_INCOME`                    | `reporting_income`            | Yes     | Temporary deterministic success processor              |
+| `SET_REMINDER`                  | `set_a_reminder`              | Yes     | Temporary deterministic success processor              |
+| `ANSWER_QUESTION`               | `asking_a_question`           | No      | OpenAI-backed question answering processor             |
+| `CALCULATE_INCOME_EXPENSES`     | `calculate_income_expenses`   | Yes     | OpenAI-backed income/expense ledger normalization      |
+| `SHOW_EXPENSES`                 | `show_expenses`               | Yes     | Selects processed outgoing ledger rows and replies     |
+| `SHOW_INCOME`                   | `show_income`                 | Yes     | Selects processed incoming ledger rows and replies     |
+| `SHOW_ALL`                      | `show_all`                    | Yes     | Selects processed income/expense rows, friendly format |
+| `SHOW_ALL_DETAILED`             | `show_all_detailed`           | Yes     | Selects processed income/expense rows with notes       |
+
+Direct command actions bypass the classifier:
+
+| Command          | Action code                       |
+| ---------------- | --------------------------------- |
+| `/calculate`     | `CALCULATE_INCOME_EXPENSES`       |
+| `/calc`          | `CALCULATE_INCOME_EXPENSES`       |
+| `/show_expenses` | `SHOW_EXPENSES`                   |
+| `/show_income`   | `SHOW_INCOME`                     |
+| `/show_all`      | `SHOW_ALL`                        |
+| `/show_all_detailed` | `SHOW_ALL_DETAILED`            |
 
 The action detection prompt is:
 
@@ -1476,8 +1492,11 @@ As the system matures, this could be made more flexible by distinguishing requir
 | --------------------------------- | ---------------------------------------------------------------- |
 | `action_detection.py`             | Source-row action detection orchestration and audit persistence  |
 | `action_detection_openai.py`      | OpenAI classifier adapter for canonical text action labels       |
+| `action_commands.py`              | Direct Telegram command to action-code mapping                   |
 | `action_detection_validation.py`  | Strict validation of provider action label output                |
+| `income_expense_calculation_openai.py` | OpenAI adapter for messy CSV to normalized ledger rows      |
 | `question_answering_openai.py`    | OpenAI question-answering adapter requiring an `answer` block    |
+| `action_processors/income_expenses.py` | `/calculate` and processed ledger report workflows          |
 | `action_processors/questions.py`  | `ANSWER_QUESTION` workflow, reply sending, outbound idempotency  |
 | `action_processors/temporary.py`  | Temporary processors for expenses, income, and reminders         |
 | `telegram_message_utils.py`       | Telegram-safe text chunking helpers                              |
@@ -1836,6 +1855,7 @@ outbound_json is the external side-effect ledger.
 action_catalog is the durable vocabulary of supported action families.
 action_detection_runs is the classifier audit trail.
 incoming_message_actions is the durable child-work queue.
+incoming_outgoing_expenses is the processed income/expense ledger.
 status is queue mechanics.
 stage is workflow meaning.
 reaction is visible but non-authoritative feedback.

@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from bot_libs.action_detection import ActionDetectionService
 from bot_libs.action_models import (
-    ACTION_ANSWER_QUESTION,
+    ACTION_CALCULATE_INCOME_EXPENSES,
     ACTION_DETECTION_COMPLETE,
+    ACTION_DETECTION_FAILED,
     ACTION_DETECTION_PENDING,
     ACTION_LOG_EXPENSES,
+    ACTION_SHOW_ALL_DETAILED,
+    ACTION_SHOW_EXPENSES,
     ProviderActionDetectionResult,
 )
 from bot_libs.queue_models import CONTENT_TYPE_TEXT, QueueJobData
-from bot_libs.queue_processor_errors import RetryableJobError
+from bot_libs.queue_processor_errors import PermanentJobError, RetryableJobError
 from bot_libs.sql import SQLiteQueueStore, SQLiteSettings
 
 
@@ -85,7 +89,45 @@ class ActionDetectionServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(actions), 1)
             self.assertEqual(actions[0]["action_code"], ACTION_LOG_EXPENSES)
 
-    async def test_detect_actions_creates_question_action_job(self) -> None:
+    async def test_detect_actions_maps_direct_commands_without_provider(self) -> None:
+        cases = (
+            ("/calculate", ACTION_CALCULATE_INCOME_EXPENSES),
+            ("/calc extra text", ACTION_CALCULATE_INCOME_EXPENSES),
+            ("/show_expenses@my_bot", ACTION_SHOW_EXPENSES),
+            ("/show_all_detailed", ACTION_SHOW_ALL_DETAILED),
+        )
+        for command_text, action_code in cases:
+            with self.subTest(command_text=command_text):
+                with TemporaryDirectory() as tmpdir:
+                    db_path = Path(tmpdir) / "queue.sqlite"
+                    store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
+                    store.create_schema(create_parent_dir=True)
+                    job = replace(
+                        make_job(),
+                        text=command_text,
+                        processing_text=command_text,
+                    )
+                    insert_result = store.insert_queue_job(job)
+                    self.assertIsNotNone(insert_result.queue_id)
+                    row = store.get_queue_job(int(insert_result.queue_id))
+                    self.assertIsNotNone(row)
+                    service = ActionDetectionService(
+                        queue_store=store,
+                        provider=ExplodingProvider(),
+                        provider_name="fake",
+                        prompt_id="prompt",
+                    )
+
+                    result = await service.detect_actions(row)
+
+                    self.assertEqual(result["status"], ACTION_DETECTION_COMPLETE)
+                    self.assertEqual(result["action_codes"], [action_code])
+                    self.assertEqual(result["created_action_count"], 1)
+                    actions = store.get_actions_for_queue_job(int(insert_result.queue_id))
+                    self.assertEqual(len(actions), 1)
+                    self.assertEqual(actions[0]["action_code"], action_code)
+
+    async def test_detect_actions_fails_disabled_question_action_without_child_job(self) -> None:
         with TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "queue.sqlite"
             store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
@@ -102,12 +144,17 @@ class ActionDetectionServiceTests(unittest.IsolatedAsyncioTestCase):
                 prompt_id="prompt",
             )
 
-            result = await service.detect_actions(row)
+            with self.assertRaises(PermanentJobError):
+                await service.detect_actions(row)
 
-            self.assertEqual(result["action_codes"], [ACTION_ANSWER_QUESTION])
+            failed_row = store.get_queue_job(int(insert_result.queue_id))
+            self.assertIsNotNone(failed_row)
+            self.assertEqual(
+                failed_row["action_detection_status"],
+                ACTION_DETECTION_FAILED,
+            )
             actions = store.get_actions_for_queue_job(int(insert_result.queue_id))
-            self.assertEqual(len(actions), 1)
-            self.assertEqual(actions[0]["action_code"], ACTION_ANSWER_QUESTION)
+            self.assertEqual(actions, ())
 
     async def test_complete_detection_skips_provider(self) -> None:
         with TemporaryDirectory() as tmpdir:

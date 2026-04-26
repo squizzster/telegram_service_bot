@@ -58,6 +58,7 @@ def catalog() -> dict[str, ActionCatalogEntry]:
         id=4,
         code=ACTION_ANSWER_QUESTION,
         provider_label=ACTION_PROVIDER_ASKING_A_QUESTION,
+        is_enabled=False,
     )
     return {
         item.provider_label: item
@@ -87,18 +88,12 @@ class ActionDetectionValidationTests(unittest.TestCase):
         )
         self.assertFalse(result.none)
 
-    def test_question_action_maps_to_internal_code(self) -> None:
-        result = validate_provider_actions(
-            '["asking_a_question"]',
-            catalog_by_provider_label=catalog(),
-        )
-
-        self.assertEqual(
-            result.provider_labels,
-            (ACTION_PROVIDER_ASKING_A_QUESTION,),
-        )
-        self.assertEqual(result.action_codes, (ACTION_ANSWER_QUESTION,))
-        self.assertFalse(result.none)
+    def test_disabled_question_action_is_permanent_configuration_error(self) -> None:
+        with self.assertRaises(PermanentJobError):
+            validate_provider_actions(
+                '["asking_a_question"]',
+                catalog_by_provider_label=catalog(),
+            )
 
     def test_none_is_valid_without_child_actions(self) -> None:
         result = validate_provider_actions(

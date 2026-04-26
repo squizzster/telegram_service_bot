@@ -7,6 +7,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
+from bot_libs.action_commands import direct_action_command_for_text
 from bot_libs.action_detection_openai import (
     OPENAI_ACTION_DETECTION_PROVIDER,
     detect_actions_with_openai,
@@ -66,13 +67,21 @@ class ActionDetectionService:
         if incoming_text is None:
             raise PermanentJobError("action detection requires processing_text")
 
+        direct_command = direct_action_command_for_text(incoming_text)
+        detection_provider_name = (
+            "command" if direct_command is not None else self.provider_name
+        )
+        detection_prompt_id = (
+            direct_command.command if direct_command is not None else self.prompt_id
+        )
+        detection_prompt_version = None if direct_command is not None else self.prompt_version
         incoming_text_sha256 = hashlib.sha256(incoming_text.encode("utf-8")).hexdigest()
         log.debug(
             "Action detection starting queue_id=%s provider=%s prompt_id=%s "
             "chars=%s sha256=%s",
             queue_id,
-            self.provider_name,
-            self.prompt_id,
+            detection_provider_name,
+            detection_prompt_id,
             len(incoming_text),
             incoming_text_sha256,
         )
@@ -81,34 +90,51 @@ class ActionDetectionService:
             queue_id,
         )
         detection_run_id = await asyncio.to_thread(
-            self.queue_store.start_action_detection_run,
-            queue_id=queue_id,
-            provider=self.provider_name,
-            prompt_id=self.prompt_id,
-            prompt_version=self.prompt_version,
-            incoming_text_chars=len(incoming_text),
-            incoming_text_sha256=incoming_text_sha256,
-        )
+                self.queue_store.start_action_detection_run,
+                queue_id=queue_id,
+                provider=detection_provider_name,
+                prompt_id=detection_prompt_id,
+                prompt_version=detection_prompt_version,
+                incoming_text_chars=len(incoming_text),
+                incoming_text_sha256=incoming_text_sha256,
+            )
 
         provider_result: ProviderActionDetectionResult | None = None
         try:
-            provider_result = await self.provider(incoming_text=incoming_text)
-            catalog = await asyncio.to_thread(
-                self.queue_store.get_action_catalog_by_provider_label
-            )
-            normalized = validate_provider_actions(
-                provider_result.raw_actions_text,
-                catalog_by_provider_label=catalog,
-            )
-            normalized_json = normalized.as_json_dict()
-            normalized_json["status"] = ACTION_DETECTION_COMPLETE
+            if direct_command is not None:
+                normalized_json = {
+                    "provider_labels": [direct_command.provider_label],
+                    "action_codes": [direct_command.action_code],
+                    "none": False,
+                    "status": ACTION_DETECTION_COMPLETE,
+                    "command": direct_command.command,
+                }
+                raw_response_json = {
+                    "command": direct_command.command,
+                    "provider_label": direct_command.provider_label,
+                    "action_code": direct_command.action_code,
+                }
+                action_codes = (direct_command.action_code,)
+            else:
+                provider_result = await self.provider(incoming_text=incoming_text)
+                catalog = await asyncio.to_thread(
+                    self.queue_store.get_action_catalog_by_provider_label
+                )
+                normalized = validate_provider_actions(
+                    provider_result.raw_actions_text,
+                    catalog_by_provider_label=catalog,
+                )
+                normalized_json = normalized.as_json_dict()
+                normalized_json["status"] = ACTION_DETECTION_COMPLETE
+                raw_response_json = provider_result.raw_response
+                action_codes = normalized.action_codes
             result_json = await asyncio.to_thread(
                 self.queue_store.complete_action_detection,
                 queue_id=queue_id,
                 detection_run_id=detection_run_id,
-                raw_response_json=provider_result.raw_response,
+                raw_response_json=raw_response_json,
                 normalized_actions_json=normalized_json,
-                action_codes=normalized.action_codes,
+                action_codes=action_codes,
             )
         except RetryableJobError as exc:
             await asyncio.to_thread(

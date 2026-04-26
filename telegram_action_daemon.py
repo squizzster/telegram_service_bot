@@ -595,6 +595,7 @@ class ActionDaemon:
         return ActionProcessingContext(
             set_stage=set_stage,
             set_outbound_json=set_outbound_json,
+            queue_store=self.queue_store,
         )
 
     def _install_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:

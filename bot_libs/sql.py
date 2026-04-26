@@ -4,8 +4,9 @@ import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from bot_libs.action_models import (
     ACTION_CATALOG_SEED,
@@ -20,6 +21,8 @@ from bot_libs.action_models import (
     ACTION_DETECTION_NOT_APPLICABLE,
     ACTION_DETECTION_PENDING,
     ACTION_DETECTION_PROCESSING,
+    ACTION_LOG_EXPENSES,
+    ACTION_LOG_INCOME,
 )
 from bot_libs.queue_models import (
     QueueInsertResult,
@@ -39,11 +42,12 @@ from bot_libs.stage_names import (
     STAGE_RETRY_WAITING,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 QUEUE_TABLE_NAME = "telegram_queue"
 ACTION_CATALOG_TABLE_NAME = "action_catalog"
 ACTION_DETECTION_RUNS_TABLE_NAME = "action_detection_runs"
 INCOMING_MESSAGE_ACTIONS_TABLE_NAME = "incoming_message_actions"
+INCOMING_OUTGOING_EXPENSES_TABLE_NAME = "incoming_outgoing_expenses"
 
 EXPECTED_INDEX_NAMES = frozenset(
     {
@@ -56,6 +60,11 @@ EXPECTED_INDEX_NAMES = frozenset(
         "idx_incoming_message_actions_status_available",
         "idx_incoming_message_actions_queue",
         "idx_incoming_message_actions_action_status",
+        "idx_incoming_message_actions_income_expense_processed",
+        "idx_incoming_outgoing_expenses_week_direction",
+        "idx_incoming_outgoing_expenses_entry",
+        "idx_incoming_outgoing_expenses_source_action",
+        "idx_incoming_outgoing_expenses_calculation_action",
     }
 )
 EXPECTED_COLUMNS_BY_TABLE = {
@@ -163,9 +172,29 @@ EXPECTED_COLUMNS_BY_TABLE = {
             "result_json",
             "outbound_json",
             "last_error",
+            "income_expense_processed_at",
+            "income_expense_processed_by_action_id",
             "created_at",
             "updated_at",
             "finished_at",
+        }
+    ),
+    INCOMING_OUTGOING_EXPENSES_TABLE_NAME: frozenset(
+        {
+            "id",
+            "entry_id",
+            "source_action_id",
+            "calculation_action_id",
+            "result_order",
+            "week_year",
+            "week_number",
+            "entry_date_time_utc",
+            "direction",
+            "description",
+            "notes",
+            "price_value",
+            "raw_item_json",
+            "created_at",
         }
     ),
 }
@@ -198,6 +227,34 @@ EXPECTED_FOREIGN_KEYS = frozenset(
             ACTION_CATALOG_TABLE_NAME,
             "id",
             "NO ACTION",
+        ),
+        (
+            INCOMING_MESSAGE_ACTIONS_TABLE_NAME,
+            "income_expense_processed_by_action_id",
+            INCOMING_MESSAGE_ACTIONS_TABLE_NAME,
+            "id",
+            "SET NULL",
+        ),
+        (
+            INCOMING_OUTGOING_EXPENSES_TABLE_NAME,
+            "entry_id",
+            QUEUE_TABLE_NAME,
+            "id",
+            "CASCADE",
+        ),
+        (
+            INCOMING_OUTGOING_EXPENSES_TABLE_NAME,
+            "source_action_id",
+            INCOMING_MESSAGE_ACTIONS_TABLE_NAME,
+            "id",
+            "SET NULL",
+        ),
+        (
+            INCOMING_OUTGOING_EXPENSES_TABLE_NAME,
+            "calculation_action_id",
+            INCOMING_MESSAGE_ACTIONS_TABLE_NAME,
+            "id",
+            "SET NULL",
         ),
     }
 )
@@ -416,6 +473,10 @@ CREATE TABLE IF NOT EXISTS incoming_message_actions (
     result_json TEXT,
     outbound_json TEXT,
     last_error TEXT,
+    income_expense_processed_at TEXT,
+    income_expense_processed_by_action_id INTEGER
+        REFERENCES incoming_message_actions(id)
+        ON DELETE SET NULL,
 
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -432,6 +493,57 @@ ON incoming_message_actions(queue_id, id);
 
 CREATE INDEX IF NOT EXISTS idx_incoming_message_actions_action_status
 ON incoming_message_actions(action_code, status, available_at, id);
+
+CREATE TABLE IF NOT EXISTS incoming_outgoing_expenses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    entry_id INTEGER NOT NULL
+        REFERENCES telegram_queue(id)
+        ON DELETE CASCADE,
+
+    source_action_id INTEGER
+        REFERENCES incoming_message_actions(id)
+        ON DELETE SET NULL,
+
+    calculation_action_id INTEGER
+        REFERENCES incoming_message_actions(id)
+        ON DELETE SET NULL,
+
+    result_order INTEGER NOT NULL DEFAULT 0
+        CHECK (result_order >= 0),
+
+    week_year INTEGER NOT NULL
+        CHECK (week_year >= 1970),
+
+    week_number INTEGER NOT NULL
+        CHECK (week_number BETWEEN 1 AND 53),
+
+    entry_date_time_utc TEXT NOT NULL,
+
+    direction TEXT NOT NULL
+        CHECK (direction IN ('incoming', 'outgoing')),
+
+    description TEXT NOT NULL,
+    notes TEXT,
+    price_value TEXT NOT NULL,
+    raw_item_json TEXT NOT NULL,
+
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    UNIQUE(calculation_action_id, result_order)
+);
+
+CREATE INDEX IF NOT EXISTS idx_incoming_outgoing_expenses_week_direction
+ON incoming_outgoing_expenses(week_year, week_number, direction, id);
+
+CREATE INDEX IF NOT EXISTS idx_incoming_outgoing_expenses_entry
+ON incoming_outgoing_expenses(entry_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_incoming_outgoing_expenses_source_action
+ON incoming_outgoing_expenses(source_action_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_incoming_outgoing_expenses_calculation_action
+ON incoming_outgoing_expenses(calculation_action_id, id);
 """.strip()
 
 INSERT_QUEUE_JOB_SQL = """
@@ -629,6 +741,7 @@ class SQLiteQueueStore:
         try:
             with self._connect(allow_create=True) as conn:
                 conn.executescript(SCHEMA_SQL)
+                _ensure_development_schema(conn)
                 _seed_action_catalog(conn)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 conn.commit()
@@ -704,6 +817,7 @@ class SQLiteQueueStore:
                 for table_name in (
                     ACTION_DETECTION_RUNS_TABLE_NAME,
                     INCOMING_MESSAGE_ACTIONS_TABLE_NAME,
+                    INCOMING_OUTGOING_EXPENSES_TABLE_NAME,
                 ):
                     index_names.update(
                         row["name"]
@@ -721,6 +835,7 @@ class SQLiteQueueStore:
                     (
                         ACTION_DETECTION_RUNS_TABLE_NAME,
                         INCOMING_MESSAGE_ACTIONS_TABLE_NAME,
+                        INCOMING_OUTGOING_EXPENSES_TABLE_NAME,
                     ),
                 )
 
@@ -1023,6 +1138,10 @@ class SQLiteQueueStore:
                     raise QueueStoreError(
                         f"Action catalog missing code={action_code!r}"
                     )
+                if not entry.is_enabled or not entry.is_executable:
+                    raise QueueStoreError(
+                        f"Action catalog entry is not executable code={action_code!r}"
+                    )
                 cursor = conn.execute(
                     """
                     INSERT OR IGNORE INTO incoming_message_actions (
@@ -1221,6 +1340,10 @@ class SQLiteQueueStore:
                         raise QueueStoreError(
                             f"Action catalog missing code={action_code!r}"
                         )
+                    if not entry.is_enabled or not entry.is_executable:
+                        raise QueueStoreError(
+                            f"Action catalog entry is not executable code={action_code!r}"
+                        )
                     cursor = conn.execute(
                         """
                         INSERT OR IGNORE INTO incoming_message_actions (
@@ -1257,6 +1380,278 @@ class SQLiteQueueStore:
                     ORDER BY id
                     """,
                     (queue_id,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise self._coerce_sqlite_error(exc) from exc
+
+        return tuple(dict(row) for row in rows)
+
+    def get_unprocessed_income_expense_source_actions(
+        self,
+    ) -> tuple[dict[str, Any], ...]:
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        ima.id AS action_id,
+                        ima.queue_id AS entry_id,
+                        ima.action_code,
+                        tq.telegram_date AS date_time_utc,
+                        tq.processing_text AS description
+                    FROM incoming_message_actions AS ima
+                    JOIN telegram_queue AS tq
+                      ON tq.id = ima.queue_id
+                    WHERE ima.action_code IN (?, ?)
+                      AND ima.status = ?
+                      AND tq.status = ?
+                      AND ima.income_expense_processed_at IS NULL
+                      AND tq.processing_text IS NOT NULL
+                    ORDER BY tq.telegram_date, tq.id, ima.detected_order, ima.id
+                    """,
+                    (
+                        ACTION_LOG_EXPENSES,
+                        ACTION_LOG_INCOME,
+                        ACTION_STATUS_DONE,
+                        STATUS_DONE,
+                    ),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise self._coerce_sqlite_error(exc) from exc
+
+        return tuple(dict(row) for row in rows)
+
+    def get_income_expense_rows_for_calculation_action(
+        self,
+        calculation_action_id: int,
+    ) -> tuple[dict[str, Any], ...]:
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM incoming_outgoing_expenses
+                    WHERE calculation_action_id = ?
+                    ORDER BY result_order, id
+                    """,
+                    (calculation_action_id,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise self._coerce_sqlite_error(exc) from exc
+
+        return tuple(dict(row) for row in rows)
+
+    def record_income_expense_calculation(
+        self,
+        *,
+        calculation_action_id: int,
+        source_action_ids: tuple[int, ...],
+        entries: tuple[Mapping[str, Any], ...],
+    ) -> tuple[dict[str, Any], ...]:
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = self._connect()
+            conn.execute("BEGIN IMMEDIATE")
+
+            if source_action_ids:
+                placeholders = ",".join("?" for _ in source_action_ids)
+                source_rows = conn.execute(
+                    f"""
+                    SELECT
+                        ima.id AS action_id,
+                        ima.queue_id AS entry_id,
+                        ima.action_code,
+                        ima.income_expense_processed_at
+                    FROM incoming_message_actions AS ima
+                    WHERE ima.id IN ({placeholders})
+                      AND ima.action_code IN (?, ?)
+                      AND ima.status = ?
+                    ORDER BY ima.id
+                    """,
+                    (
+                        *source_action_ids,
+                        ACTION_LOG_EXPENSES,
+                        ACTION_LOG_INCOME,
+                        ACTION_STATUS_DONE,
+                    ),
+                ).fetchall()
+                if len(source_rows) != len(set(source_action_ids)):
+                    raise QueueStoreError("income/expense source action disappeared")
+                already_processed = [
+                    row["action_id"]
+                    for row in source_rows
+                    if row["income_expense_processed_at"] is not None
+                ]
+                if already_processed:
+                    raise QueueStoreError(
+                        "income/expense source action already processed ids="
+                        + ",".join(str(item) for item in already_processed)
+                    )
+            else:
+                source_rows = []
+                if entries:
+                    raise QueueStoreError(
+                        "cannot record income/expense entries without source actions"
+                    )
+
+            source_action_by_entry_direction = _source_action_by_entry_direction(
+                source_rows
+            )
+            inserted_ids: list[int] = []
+            for result_order, entry in enumerate(entries):
+                normalized_entry = _normalize_income_expense_entry(entry)
+                source_action_id = source_action_by_entry_direction.get(
+                    (
+                        int(normalized_entry["entry_id"]),
+                        str(normalized_entry["direction"]),
+                    )
+                )
+                if source_action_ids and source_action_id is None:
+                    raise QueueStoreError(
+                        "income/expense entry does not match selected source action "
+                        f"entry_id={normalized_entry['entry_id']} "
+                        f"direction={normalized_entry['direction']}"
+                    )
+                week_year, week_number = _income_expense_week(
+                    str(normalized_entry["date_time_utc"])
+                )
+                cursor = conn.execute(
+                    """
+                    INSERT INTO incoming_outgoing_expenses (
+                        entry_id,
+                        source_action_id,
+                        calculation_action_id,
+                        result_order,
+                        week_year,
+                        week_number,
+                        entry_date_time_utc,
+                        direction,
+                        description,
+                        notes,
+                        price_value,
+                        raw_item_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(normalized_entry["entry_id"]),
+                        source_action_id,
+                        calculation_action_id,
+                        result_order,
+                        week_year,
+                        week_number,
+                        str(normalized_entry["date_time_utc"]),
+                        str(normalized_entry["direction"]),
+                        str(normalized_entry["description"]),
+                        str(normalized_entry["notes"]),
+                        str(normalized_entry["price_value"]),
+                        _normalize_json_text(dict(normalized_entry)),
+                    ),
+                )
+                inserted_ids.append(int(cursor.lastrowid))
+
+            if source_action_ids:
+                placeholders = ",".join("?" for _ in source_action_ids)
+                cursor = conn.execute(
+                    f"""
+                    UPDATE incoming_message_actions
+                    SET
+                        income_expense_processed_at = CURRENT_TIMESTAMP,
+                        income_expense_processed_by_action_id = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id IN ({placeholders})
+                      AND action_code IN (?, ?)
+                      AND status = ?
+                      AND income_expense_processed_at IS NULL
+                    """,
+                    (
+                        calculation_action_id,
+                        *source_action_ids,
+                        ACTION_LOG_EXPENSES,
+                        ACTION_LOG_INCOME,
+                        ACTION_STATUS_DONE,
+                    ),
+                )
+                if cursor.rowcount != len(set(source_action_ids)):
+                    raise QueueStoreError("failed to mark all source actions processed")
+
+            if inserted_ids:
+                placeholders = ",".join("?" for _ in inserted_ids)
+                rows = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM incoming_outgoing_expenses
+                    WHERE id IN ({placeholders})
+                    ORDER BY result_order, id
+                    """,
+                    tuple(inserted_ids),
+                ).fetchall()
+            else:
+                rows = []
+            conn.commit()
+        except sqlite3.Error as exc:
+            try:
+                if conn is not None:
+                    conn.rollback()
+            except Exception:
+                pass
+            raise self._coerce_sqlite_error(exc) from exc
+        except Exception:
+            try:
+                if conn is not None:
+                    conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            if conn is not None:
+                conn.close()
+
+        return tuple(dict(row) for row in rows)
+
+    def get_income_expense_rows_for_week(
+        self,
+        *,
+        week_year: int | None = None,
+        week_number: int | None = None,
+        direction: str | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        normalized_direction = _normalize_income_expense_direction(direction)
+        if (week_year is None) != (week_number is None):
+            raise ValueError("week_year and week_number must be provided together")
+
+        try:
+            with self._connect() as conn:
+                if week_year is None or week_number is None:
+                    latest = conn.execute(
+                        """
+                        SELECT week_year, week_number
+                        FROM incoming_outgoing_expenses
+                        WHERE (? IS NULL OR direction = ?)
+                        ORDER BY week_year DESC, week_number DESC
+                        LIMIT 1
+                        """,
+                        (normalized_direction, normalized_direction),
+                    ).fetchone()
+                    if latest is None:
+                        return ()
+                    week_year = int(latest["week_year"])
+                    week_number = int(latest["week_number"])
+
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM incoming_outgoing_expenses
+                    WHERE week_year = ?
+                      AND week_number = ?
+                      AND (? IS NULL OR direction = ?)
+                    ORDER BY entry_date_time_utc, entry_id, id
+                    """,
+                    (
+                        week_year,
+                        week_number,
+                        normalized_direction,
+                        normalized_direction,
+                    ),
                 ).fetchall()
         except sqlite3.Error as exc:
             raise self._coerce_sqlite_error(exc) from exc
@@ -2180,13 +2575,44 @@ def _add_column_if_missing(
     existing_columns: set[str],
     column_name: str,
     column_definition: str,
+    *,
+    table_name: str = QUEUE_TABLE_NAME,
 ) -> None:
     if column_name in existing_columns:
         return
     conn.execute(
-        f"ALTER TABLE {QUEUE_TABLE_NAME} ADD COLUMN {column_name} {column_definition}"
+        f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
     )
     existing_columns.add(column_name)
+
+
+def _ensure_development_schema(conn: sqlite3.Connection) -> None:
+    incoming_action_columns = {
+        row["name"]
+        for row in conn.execute(
+            f"PRAGMA table_info({INCOMING_MESSAGE_ACTIONS_TABLE_NAME})"
+        )
+    }
+    _add_column_if_missing(
+        conn,
+        incoming_action_columns,
+        "income_expense_processed_at",
+        "TEXT",
+        table_name=INCOMING_MESSAGE_ACTIONS_TABLE_NAME,
+    )
+    _add_column_if_missing(
+        conn,
+        incoming_action_columns,
+        "income_expense_processed_by_action_id",
+        "INTEGER REFERENCES incoming_message_actions(id) ON DELETE SET NULL",
+        table_name=INCOMING_MESSAGE_ACTIONS_TABLE_NAME,
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_incoming_message_actions_income_expense_processed
+        ON incoming_message_actions(action_code, status, income_expense_processed_at, id)
+        """
+    )
 
 
 def _seed_action_catalog(conn: sqlite3.Connection) -> None:
@@ -2197,13 +2623,15 @@ def _seed_action_catalog(conn: sqlite3.Connection) -> None:
             provider_label,
             name,
             description,
-            is_executable
-        ) VALUES (?, ?, ?, ?, ?)
+            is_executable,
+            is_enabled
+        ) VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(code) DO UPDATE SET
             provider_label = excluded.provider_label,
             name = excluded.name,
             description = excluded.description,
             is_executable = excluded.is_executable,
+            is_enabled = excluded.is_enabled,
             updated_at = CURRENT_TIMESTAMP
         """,
         ACTION_CATALOG_SEED,
@@ -2356,6 +2784,91 @@ def _normalize_json_text(value: Any) -> str | None:
     if isinstance(value, str):
         return value
     return stable_json_dumps(value)
+
+
+def _normalize_income_expense_entry(entry: Mapping[str, Any]) -> dict[str, object]:
+    entry_id = int(entry.get("entry_id", 0))
+    if entry_id < 1:
+        raise QueueStoreError("income/expense entry_id must be positive")
+
+    date_time_utc = str(
+        entry.get("date_time_utc") or entry.get("entry_date_time_utc") or ""
+    ).strip()
+    if not date_time_utc:
+        raise QueueStoreError("income/expense date_time_utc is required")
+    _parse_sqlite_datetime(date_time_utc)
+
+    direction = _normalize_income_expense_direction(entry.get("direction"))
+    if direction is None:
+        raise QueueStoreError("income/expense direction is required")
+
+    description = str(entry.get("description") or "").strip()
+    if not description:
+        raise QueueStoreError("income/expense description is required")
+
+    notes = str(entry.get("notes") or "").strip()
+    raw_price_value = entry.get("price_value")
+    if raw_price_value is None:
+        raw_price_value = entry.get("price")
+    price_value = _normalize_price_value(raw_price_value)
+
+    return {
+        "entry_id": entry_id,
+        "date_time_utc": _sqlite_timestamp(_parse_sqlite_datetime(date_time_utc)),
+        "direction": direction,
+        "description": description,
+        "notes": notes,
+        "price_value": price_value,
+    }
+
+
+def _normalize_income_expense_direction(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in {"expense", "expenses", "out", "outgoing"}:
+        return "outgoing"
+    if text in {"income", "incoming", "in"}:
+        return "incoming"
+    raise QueueStoreError(f"unsupported income/expense direction={value!r}")
+
+
+def _normalize_price_value(value: object) -> str:
+    if value is None:
+        raise QueueStoreError("income/expense price_value is required")
+    text = str(value).strip().replace("£", "").replace(",", "")
+    if not text:
+        raise QueueStoreError("income/expense price_value is required")
+    try:
+        amount = Decimal(text)
+    except (InvalidOperation, ValueError) as exc:
+        raise QueueStoreError(f"invalid income/expense price_value={value!r}") from exc
+    if amount < 0:
+        raise QueueStoreError("income/expense price_value must not be negative")
+    return format(amount.quantize(Decimal("0.01")), "f")
+
+
+def _income_expense_week(date_time_utc: str) -> tuple[int, int]:
+    parsed = _parse_sqlite_datetime(date_time_utc)
+    iso_year, iso_week, _ = parsed.isocalendar()
+    return int(iso_year), int(iso_week)
+
+
+def _source_action_by_entry_direction(
+    source_rows: list[sqlite3.Row],
+) -> dict[tuple[int, str], int]:
+    result: dict[tuple[int, str], int] = {}
+    for row in source_rows:
+        if row["action_code"] == ACTION_LOG_INCOME:
+            direction = "incoming"
+        elif row["action_code"] == ACTION_LOG_EXPENSES:
+            direction = "outgoing"
+        else:
+            continue
+        result[(int(row["entry_id"]), direction)] = int(row["action_id"])
+    return result
 
 
 def _sqlite_timestamp(value: datetime) -> str:

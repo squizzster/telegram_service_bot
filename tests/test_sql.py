@@ -18,11 +18,14 @@ from bot_libs.queue_models import (
 )
 from bot_libs.action_models import (
     ACTION_ANSWER_QUESTION,
+    ACTION_CALCULATE_INCOME_EXPENSES,
     ACTION_DETECTION_COMPLETE,
     ACTION_DETECTION_PENDING,
     ACTION_DETECTION_PROCESSING,
     ACTION_LOG_EXPENSES,
     ACTION_LOG_INCOME,
+    ACTION_SHOW_ALL_DETAILED,
+    ACTION_SHOW_EXPENSES,
     ACTION_PROVIDER_ASKING_A_QUESTION,
     ACTION_PROVIDER_LOG_EXPENSES,
     ACTION_PROVIDER_LOG_INCOME,
@@ -162,8 +165,24 @@ class SQLiteQueueStoreTests(unittest.TestCase):
             self.assertIn(ACTION_PROVIDER_ASKING_A_QUESTION, catalog_by_label)
             self.assertIn(ACTION_LOG_EXPENSES, catalog_by_code)
             self.assertIn(ACTION_ANSWER_QUESTION, catalog_by_code)
+            self.assertIn(ACTION_CALCULATE_INCOME_EXPENSES, catalog_by_code)
+            self.assertIn(ACTION_SHOW_EXPENSES, catalog_by_code)
+            self.assertIn(ACTION_SHOW_ALL_DETAILED, catalog_by_code)
             self.assertFalse(catalog_by_code["NONE"].is_executable)
             self.assertTrue(catalog_by_code[ACTION_LOG_INCOME].is_enabled)
+            self.assertFalse(catalog_by_code[ACTION_ANSWER_QUESTION].is_enabled)
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM sqlite_master
+                        WHERE type = 'table'
+                          AND name = 'incoming_outgoing_expenses'
+                        """
+                    ).fetchone()[0],
+                    1,
+                )
 
     def test_insert_queue_job_sets_initial_action_detection_status(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -827,6 +846,171 @@ class SQLiteQueueStoreTests(unittest.TestCase):
             self.assertEqual(dead_action["last_error"], "permanent failure")
             self.assertEqual(json.loads(dead_action["result_json"]), {"dead": True})
             self.assertIsNotNone(dead_action["finished_at"])
+
+    def test_income_expense_calculation_records_rows_and_marks_sources_processed(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.sqlite"
+            store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
+            store.create_schema(create_parent_dir=True)
+            first = store.insert_queue_job(
+                make_job(
+                    update_id=1,
+                    message_id=456,
+                    processing_text="I spent 20 pound on fish.",
+                )
+            )
+            second = store.insert_queue_job(
+                make_job(
+                    update_id=2,
+                    message_id=457,
+                    processing_text="Actually, it was thirty pounds.",
+                )
+            )
+            command = store.insert_queue_job(
+                make_job(
+                    update_id=3,
+                    message_id=458,
+                    processing_text="/calculate",
+                )
+            )
+            assert first.queue_id is not None
+            assert second.queue_id is not None
+            assert command.queue_id is not None
+            store.insert_incoming_message_actions(
+                queue_id=first.queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_LOG_EXPENSES,),
+            )
+            store.insert_incoming_message_actions(
+                queue_id=second.queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_LOG_EXPENSES,),
+            )
+            store.insert_incoming_message_actions(
+                queue_id=command.queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_CALCULATE_INCOME_EXPENSES,),
+            )
+            store.mark_job_done(first.queue_id, result_json={"ok": True})
+            store.mark_job_done(second.queue_id, result_json={"ok": True})
+            store.mark_job_done(command.queue_id, result_json={"ok": True})
+            source_one = store.claim_next_action(worker_name="worker")
+            source_two = store.claim_next_action(worker_name="worker")
+            calculation = store.claim_next_action(worker_name="worker")
+            assert source_one is not None
+            assert source_two is not None
+            assert calculation is not None
+            store.mark_action_done(int(source_one["id"]), result_json={"ok": True})
+            store.mark_action_done(int(source_two["id"]), result_json={"ok": True})
+
+            sources = store.get_unprocessed_income_expense_source_actions()
+            inserted = store.record_income_expense_calculation(
+                calculation_action_id=int(calculation["id"]),
+                source_action_ids=tuple(int(source["action_id"]) for source in sources),
+                entries=(
+                    {
+                        "entry_id": second.queue_id,
+                        "date_time_utc": "2026-04-26 11:01:30",
+                        "direction": "outgoing",
+                        "description": "Fish purchase",
+                        "notes": "Corrected from entry 1.",
+                        "price_value": "30",
+                    },
+                ),
+            )
+
+            self.assertEqual(len(sources), 2)
+            self.assertEqual(len(inserted), 1)
+            self.assertEqual(inserted[0]["entry_id"], second.queue_id)
+            self.assertEqual(inserted[0]["week_year"], 2026)
+            self.assertEqual(inserted[0]["week_number"], 17)
+            self.assertEqual(inserted[0]["price_value"], "30.00")
+            self.assertEqual(
+                store.get_unprocessed_income_expense_source_actions(),
+                (),
+            )
+            with sqlite3.connect(db_path) as conn:
+                processed_count = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM incoming_message_actions
+                    WHERE action_code = ?
+                      AND income_expense_processed_at IS NOT NULL
+                    """,
+                    (ACTION_LOG_EXPENSES,),
+                ).fetchone()[0]
+            self.assertEqual(processed_count, 2)
+
+    def test_get_income_expense_rows_for_week_filters_latest_by_direction(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.sqlite"
+            store = SQLiteQueueStore(SQLiteSettings(db_path=str(db_path)))
+            store.create_schema(create_parent_dir=True)
+            source = store.insert_queue_job(
+                make_job(
+                    update_id=1,
+                    message_id=456,
+                    processing_text="Earned 160 putting up TVs, spent 56 on aquarium.",
+                )
+            )
+            command = store.insert_queue_job(
+                make_job(update_id=2, message_id=457, processing_text="/calculate")
+            )
+            assert source.queue_id is not None
+            assert command.queue_id is not None
+            store.insert_incoming_message_actions(
+                queue_id=source.queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_LOG_INCOME, ACTION_LOG_EXPENSES),
+            )
+            store.insert_incoming_message_actions(
+                queue_id=command.queue_id,
+                detection_run_id=None,
+                action_codes=(ACTION_CALCULATE_INCOME_EXPENSES,),
+            )
+            store.mark_job_done(source.queue_id, result_json={"ok": True})
+            store.mark_job_done(command.queue_id, result_json={"ok": True})
+            income_source = store.claim_next_action(worker_name="worker")
+            expense_source = store.claim_next_action(worker_name="worker")
+            calculation = store.claim_next_action(worker_name="worker")
+            assert income_source is not None
+            assert expense_source is not None
+            assert calculation is not None
+            store.mark_action_done(int(income_source["id"]), result_json={"ok": True})
+            store.mark_action_done(int(expense_source["id"]), result_json={"ok": True})
+            sources = store.get_unprocessed_income_expense_source_actions()
+            store.record_income_expense_calculation(
+                calculation_action_id=int(calculation["id"]),
+                source_action_ids=tuple(int(source["action_id"]) for source in sources),
+                entries=(
+                    {
+                        "entry_id": source.queue_id,
+                        "date_time_utc": "2026-04-26 14:43:23",
+                        "direction": "incoming",
+                        "description": "Putting up TVs",
+                        "notes": "",
+                        "price_value": "160",
+                    },
+                    {
+                        "entry_id": source.queue_id,
+                        "date_time_utc": "2026-04-26 14:43:23",
+                        "direction": "outgoing",
+                        "description": "Aquarium",
+                        "notes": "",
+                        "price_value": "56",
+                    },
+                ),
+            )
+
+            income_rows = store.get_income_expense_rows_for_week(direction="incoming")
+            expense_rows = store.get_income_expense_rows_for_week(direction="outgoing")
+            all_rows = store.get_income_expense_rows_for_week()
+
+            self.assertEqual([row["direction"] for row in income_rows], ["incoming"])
+            self.assertEqual([row["direction"] for row in expense_rows], ["outgoing"])
+            self.assertEqual(len(all_rows), 2)
 
     def test_mark_action_for_retry_exhausted_marks_dead(self) -> None:
         with TemporaryDirectory() as tmpdir:
