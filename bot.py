@@ -19,6 +19,12 @@ from http import HTTPStatus
 
 import uvicorn
 from bot_libs.daemon_signal import resolve_daemon_pidfile, wake_queue_daemon
+from bot_libs.dev_restart import (
+    BOT_PROCESS_NAME,
+    RESTART_SIGNAL,
+    resolve_bot_pidfile,
+    restart_current_process,
+)
 from bot_libs.logging_utils import configure_app_logging
 from bot_libs.process_guard import ProcessAlreadyRunningError, acquire_process_guard
 from bot_libs.queue_enqueue import (
@@ -55,8 +61,6 @@ ALL_HTTP_METHODS = ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"]
 TELEGRAM_SECRET_HEADER = "x-telegram-bot-api-secret-token"
 SECRET_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 SERVICE_DUMP_DIR_ENV = "TELEGRAM_SERVICE_DUMP_DIR"
-BOT_PIDFILE_ENV = "TELEGRAM_BOT_PIDFILE"
-DEFAULT_BOT_PIDFILE = "/tmp/telegram_bot.pid"
 
 
 # ---------------------------------------------------------------------------
@@ -118,11 +122,6 @@ class Config:
             bot_pidfile_path=resolve_bot_pidfile(),
             daemon_pidfile_path=resolve_daemon_pidfile(),
         )
-
-
-def resolve_bot_pidfile(value: str | None = None) -> str:
-    return (value or os.getenv(BOT_PIDFILE_ENV) or DEFAULT_BOT_PIDFILE).strip()
-
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Telegram webhook bot")
@@ -407,6 +406,7 @@ class TelegramBotRunner:
         )
 
         self._started = False
+        self._restart_requested = False
 
     @property
     def webhook_url(self) -> str:
@@ -600,6 +600,7 @@ class TelegramBotRunner:
         async with self.ptb_app:
             server_task: asyncio.Task[None] | None = None
             try:
+                self._install_signal_handlers()
                 await self.start()
                 server_task = asyncio.create_task(
                     self.http_server.serve(),
@@ -617,17 +618,31 @@ class TelegramBotRunner:
                         log.exception("Error while stopping webhook HTTP server")
                 await self.stop()
 
+    def _install_signal_handlers(self) -> None:
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(RESTART_SIGNAL, self._request_restart)
+        log.debug("Signal handler installed for %s", RESTART_SIGNAL.name)
+
+    def _request_restart(self) -> None:
+        self._restart_requested = True
+        log.info("Bot restart requested by %s", RESTART_SIGNAL.name)
+        self.http_server.request_shutdown()
+
+    @property
+    def restart_requested(self) -> bool:
+        return self._restart_requested
+
 
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
-async def main(debug: bool, *, save_dump_dir: bool = False) -> None:
+async def main(debug: bool, *, save_dump_dir: bool = False) -> bool:
     await run_runtime_system_checks(component="bot")
     config = Config.from_env(save_dump_dir=save_dump_dir)
     with acquire_process_guard(
         pidfile_path=config.bot_pidfile_path,
-        process_name="telegram-bot",
+        process_name=BOT_PROCESS_NAME,
     ):
         queue_store = SQLiteQueueStore(config.sqlite_settings)
         queue_store.verify_schema()
@@ -641,6 +656,7 @@ async def main(debug: bool, *, save_dump_dir: bool = False) -> None:
             queue_store=queue_store,
         )
         await runner.run()
+        return runner.restart_requested
 
 
 if __name__ == "__main__":
@@ -648,7 +664,11 @@ if __name__ == "__main__":
     configure_logging(args.debug, trace=args.trace)
 
     try:
-        asyncio.run(main(debug=args.debug, save_dump_dir=args.save_dump_dir))
+        restart_requested = asyncio.run(
+            main(debug=args.debug, save_dump_dir=args.save_dump_dir)
+        )
+        if restart_requested:
+            restart_current_process()
     except (
         KeyError,
         ValueError,

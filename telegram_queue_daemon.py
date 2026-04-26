@@ -30,6 +30,7 @@ from bot_libs.daemon_signal import (  # noqa: E402
     resolve_action_daemon_pidfile,
     wake_action_daemon,
 )
+from bot_libs.dev_restart import RESTART_SIGNAL, restart_current_process  # noqa: E402
 from bot_libs.logging_utils import configure_app_logging  # noqa: E402
 from bot_libs.process_guard import (  # noqa: E402
     ProcessAlreadyRunningError,
@@ -186,9 +187,10 @@ class QueueDaemon:
         self._wake_event = asyncio.Event()
         self._pending_wakeups = 0
         self._stop_requested = False
+        self._restart_requested = False
         self._reaction_reconcile_tasks: set[asyncio.Task[None]] = set()
 
-    async def run(self, *, once: bool = False) -> None:
+    async def run(self, *, once: bool = False) -> bool:
         log.debug(
             "Queue daemon starting worker=%s db_path=%s poll_seconds=%s "
             "stale_lock_seconds=%s max_attempts=%s pidfile=%s once=%s",
@@ -211,7 +213,7 @@ class QueueDaemon:
 
         loop = asyncio.get_running_loop()
         self._install_signal_handlers(loop)
-        log.debug("Signal handlers installed for SIGHUP/SIGTERM/SIGINT")
+        log.debug("Signal handlers installed for SIGHUP/SIGTERM/SIGINT/SIGUSR1")
 
         async with Bot(self.config.token) as bot:
             await self._recover_stale_processing_jobs()
@@ -228,7 +230,7 @@ class QueueDaemon:
                         self._stop_requested,
                     )
                     await self._drain_reaction_reconcile_tasks()
-                    return
+                    return self._restart_requested
 
                 await self.wait_for_wakeup()
 
@@ -988,6 +990,7 @@ class QueueDaemon:
         loop.add_signal_handler(signal.SIGHUP, self._handle_signal, signal.SIGHUP)
         loop.add_signal_handler(signal.SIGTERM, self._handle_signal, signal.SIGTERM)
         loop.add_signal_handler(signal.SIGINT, self._handle_signal, signal.SIGINT)
+        loop.add_signal_handler(RESTART_SIGNAL, self._handle_signal, RESTART_SIGNAL)
 
     def _handle_signal(self, sig: signal.Signals) -> None:
         if sig is signal.SIGHUP:
@@ -997,6 +1000,12 @@ class QueueDaemon:
                 sig.name,
                 self._pending_wakeups,
             )
+            self._wake_event.set()
+            return
+        if sig is RESTART_SIGNAL:
+            self._restart_requested = True
+            log.info("queue daemon restart requested by %s", sig.name)
+            self._stop_requested = True
             self._wake_event.set()
             return
 
@@ -1057,7 +1066,7 @@ def configure_logging(debug: bool, *, trace: bool = False) -> None:
     configure_app_logging(debug=debug, trace=trace)
 
 
-async def run_daemon(args: argparse.Namespace) -> None:
+async def run_daemon(args: argparse.Namespace) -> bool:
     await run_runtime_system_checks(component="queue-daemon")
     config = Config.from_env(
         worker_name=args.worker_name,
@@ -1071,7 +1080,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
         pidfile_path=config.pidfile_path,
         process_name=DAEMON_PROCESS_NAME,
     ):
-        await daemon.run(once=args.once)
+        return await daemon.run(once=args.once)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1079,7 +1088,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_logging(args.debug, trace=args.trace)
 
     try:
-        asyncio.run(run_daemon(args))
+        restart_requested = asyncio.run(run_daemon(args))
+        if restart_requested:
+            restart_current_process()
     except (KeyError, ValueError, ProcessAlreadyRunningError, RuntimeCheckError) as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 1

@@ -267,6 +267,18 @@ class TelegramActionDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker._pending_wakeups, 0)
         self.assertFalse(worker._wake_event.is_set())
 
+    async def test_usr1_requests_restart_and_wakes_loop(self) -> None:
+        worker = daemon.ActionDaemon(
+            config=self.make_config(),
+            queue_store=FakeActionStore(),
+        )
+
+        worker._handle_signal(signal.SIGUSR1)
+
+        self.assertTrue(worker._restart_requested)
+        self.assertTrue(worker._stop_requested)
+        self.assertTrue(worker._wake_event.is_set())
+
     @patch("telegram_action_daemon.asyncio.to_thread", new=immediate_to_thread)
     async def test_process_one_action_marks_success_done_and_sets_reactions(self) -> None:
         store = FakeActionStore()

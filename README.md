@@ -1419,7 +1419,21 @@ This converts process death into ordinary retryable work.
 
 This reduces latency without coupling correctness to IPC.
 
-## 17.4 Runtime checks
+## 17.4 Development restart
+
+`SIGUSR1` asks the bot, queue daemon, or action daemon to restart itself.
+
+Each runtime exits through its normal cleanup path, releases its pidfile lock, then re-execs the same Python command. This keeps local development terminals and log tails alive without introducing systemd yet.
+
+To restart all currently running development processes from this checkout:
+
+```bash
+python -m bot_libs.dev_restart
+```
+
+The helper validates pidfile metadata before sending `SIGUSR1`, so it will skip missing, stale, or unexpected processes.
+
+## 17.5 Runtime checks
 
 Startup checks validate the environment before accepting work.
 
